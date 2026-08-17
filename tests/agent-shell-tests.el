@@ -4047,6 +4047,428 @@ Gemini sends these fields as empty arrays."
               (:content . [])
               (:locations . []))))))
 
+;;; Tests for agent-shell--elicitation-form-fields
+
+(ert-deftest agent-shell--elicitation-form-fields-single-select-test ()
+  "Test `agent-shell--elicitation-form-fields' walks a single-select question."
+  (should (equal
+           '(((:name . question_0)
+              (:title . "Auth")
+              (:description)
+              (:options . (((:value . "JWT")
+                            (:title . "JWT")
+                            (:description . "Stateless"))
+                           ((:value . "Session")
+                            (:title . "Session")
+                            (:description))))))
+           (agent-shell--elicitation-form-fields
+            '((type . "object")
+              (properties . ((question_0 . ((type . "string")
+                                            (title . "Auth")
+                                            (oneOf . [((const . "JWT")
+                                                       (title . "JWT")
+                                                       (description . "Stateless"))
+                                                      ((const . "Session")
+                                                       (title . "Session"))]))))))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-refusal-fallback-test ()
+  "Test `agent-shell--elicitation-form-fields' walks the refusal-fallback dialog.
+
+The dialog an agent raises after a model declines a turn is a plain
+single-select, so it renders through the same path."
+  (let ((fields (agent-shell--elicitation-form-fields
+                 '((type . "object")
+                   (properties . ((choice . ((type . "string")
+                                             (title . "Retry?")
+                                             (oneOf . [((const . "retry_fallback")
+                                                        (title . "Retry with fallback"))
+                                                       ((const . "cancelled")
+                                                        (title . "Keep refusal"))])))))))))
+    (should (equal 1 (length fields)))
+    (should (equal 'choice (map-elt (car fields) :name)))
+    (should (equal '("retry_fallback" "cancelled")
+                   (mapcar (lambda (option) (map-elt option :value))
+                           (map-elt (car fields) :options))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-preserves-question-order-test ()
+  "Test `agent-shell--elicitation-form-fields' keeps schema order."
+  (should (equal
+           '(question_0 question_1)
+           (mapcar (lambda (field) (map-elt field :name))
+                   (agent-shell--elicitation-form-fields
+                    '((type . "object")
+                      (properties . ((question_0 . ((type . "string")
+                                                    (description . "First?")
+                                                    (oneOf . [((const . "a") (title . "a"))])))
+                                     (question_1 . ((type . "string")
+                                                    (description . "Second?")
+                                                    (oneOf . [((const . "b") (title . "b"))])))))))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-skips-custom-answer-test ()
+  "Test `agent-shell--elicitation-form-fields' skips a custom answer field.
+
+The field is optional and no schema carrying one marks it required, so
+skipping it still produces a valid answer."
+  (let ((fields (agent-shell--elicitation-form-fields
+                 '((type . "object")
+                   (properties . ((question_0 . ((type . "string")
+                                                 (oneOf . [((const . "a") (title . "a"))])))
+                                  (question_0_custom
+                                   . ((type . "string")
+                                      (title . "Other")
+                                      (_meta . ((_askUserQuestionCustomAnswer
+                                                 . ((questionId . "question_0")
+                                                    (isCustomAnswer . t)))))))))))))
+    (should (equal 1 (length fields)))
+    (should (equal 'question_0 (map-elt (car fields) :name)))))
+
+(ert-deftest agent-shell--elicitation-form-fields-rejects-multi-select-test ()
+  "Test `agent-shell--elicitation-form-fields' declines a multi-select field."
+  (should (equal
+           'unsupported
+           (agent-shell--elicitation-form-fields
+            '((type . "object")
+              (properties . ((question_0 . ((type . "array")
+                                            (items . ((anyOf . [((const . "a") (title . "a"))]))))))))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-rejects-required-test ()
+  "Test `agent-shell--elicitation-form-fields' declines a required list.
+
+An MCP form may mark fields required.  Skipping one would then make the
+answer invalid, so the whole form is declined."
+  (should (equal
+           'unsupported
+           (agent-shell--elicitation-form-fields
+            '((type . "object")
+              (required . ["question_0"])
+              (properties . ((question_0 . ((type . "string")
+                                            (oneOf . [((const . "a") (title . "a"))]))))))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-rejects-unknown-type-test ()
+  "Test `agent-shell--elicitation-form-fields' declines a non-select field."
+  (should (equal
+           'unsupported
+           (agent-shell--elicitation-form-fields
+            '((type . "object")
+              (properties . ((count . ((type . "number")
+                                       (title . "How many?"))))))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-rejects-empty-properties-test ()
+  "Test `agent-shell--elicitation-form-fields' declines a form with no fields."
+  (should (equal 'unsupported
+                 (agent-shell--elicitation-form-fields '((type . "object")))))
+  (should (equal 'unsupported
+                 (agent-shell--elicitation-form-fields
+                  '((type . "object") (properties . nil))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-rejects-non-string-option-test ()
+  "Test `agent-shell--elicitation-form-fields' declines a non-string option.
+
+The response sends the option verbatim and the agent silently discards
+content of the wrong type, so a non-string option cannot be answered."
+  (should (equal
+           'unsupported
+           (agent-shell--elicitation-form-fields
+            '((type . "object")
+              (properties . ((question_0 . ((type . "string")
+                                            (oneOf . [((const . 1) (title . "one"))]))))))))))
+
+;;; Tests for elicitation/create handling
+
+(defun agent-shell-tests--elicitation-state (buffer)
+  "Return a minimal session state for elicitation tests, backed by BUFFER.
+
+Built with `list' rather than a backquote: tests store into
+`:elicitations', and a backquoted literal shares its constant tail across
+calls, which leaks state from one test into the next."
+  (list (cons :buffer buffer)
+        (cons :client 'test-client)
+        (cons :elicitations nil)
+        (cons :tool-calls nil)
+        (cons :event-subscriptions nil)
+        (cons :request-count 0)
+        (cons :idle-timer nil)
+        (cons :active-requests nil)
+        (cons :last-entry-type nil)))
+
+(defmacro agent-shell-tests--with-elicitation-stubs (captured-responses &rest body)
+  "Run BODY with elicitation UI stubbed, collecting sent responses.
+
+CAPTURED-RESPONSES is a variable bound to the list of responses, oldest
+first."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'acp-send-response)
+              (lambda (&rest args)
+                (setq ,captured-responses
+                      (append ,captured-responses (list (plist-get args :response))))))
+             ((symbol-function 'agent-shell--update-fragment) (lambda (&rest _)))
+             ((symbol-function 'agent-shell--delete-fragment) (lambda (&rest _)))
+             ((symbol-function 'agent-shell--start-idle-timer) (lambda (&rest _)))
+             ((symbol-function 'agent-shell-jump-to-latest-permission-button-row)
+              (lambda (&rest _) t))
+             ((symbol-function 'agent-shell-viewport--buffer) (lambda (&rest _) nil)))
+     ,@body))
+
+(ert-deftest agent-shell--on-request-declines-non-form-elicitation-test ()
+  "Test a non-form elicitation mode is declined rather than left hanging."
+  (with-temp-buffer
+    (let ((responses nil)
+          (state (agent-shell-tests--elicitation-state (current-buffer))))
+      (agent-shell-tests--with-elicitation-stubs responses
+        (agent-shell--on-request
+         :state state
+         :acp-request '((id . 7)
+                        (method . "elicitation/create")
+                        (params . ((mode . "url")
+                                   (sessionId . "sess-1")
+                                   (message . "Open this?")))))
+        (should (equal 1 (length responses)))
+        (should (equal 7 (map-elt (car responses) :request-id)))
+        (should (equal "decline" (map-nested-elt (car responses) '(:result action))))
+        (should-not (map-elt state :elicitations))
+        (should-not (map-elt state :last-entry-type))))))
+
+(ert-deftest agent-shell--on-request-declines-unsupported-elicitation-test ()
+  "Test an unrenderable schema is declined rather than partially answered."
+  (with-temp-buffer
+    (let ((responses nil)
+          (state (agent-shell-tests--elicitation-state (current-buffer))))
+      (agent-shell-tests--with-elicitation-stubs responses
+        (agent-shell--on-request
+         :state state
+         :acp-request '((id . 8)
+                        (method . "elicitation/create")
+                        (params . ((mode . "form")
+                                   (sessionId . "sess-1")
+                                   (message . "Pick some")
+                                   (requestedSchema
+                                    . ((type . "object")
+                                       (properties . ((question_0 . ((type . "array")
+                                                                     (items . ((anyOf . [((const . "a") (title . "a"))])))))))))))))
+        (should (equal 1 (length responses)))
+        (should (equal "decline" (map-nested-elt (car responses) '(:result action))))
+        (should-not (map-elt state :elicitations))))))
+
+(ert-deftest agent-shell--on-request-saves-elicitation-test ()
+  "Test a renderable elicitation is stored and awaits an answer."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--on-request
+           :state state
+           :acp-request '((id . 9)
+                          (method . "elicitation/create")
+                          (params . ((mode . "form")
+                                     (sessionId . "sess-1")
+                                     (toolCallId . "toolu_1")
+                                     (message . "Which auth approach?")
+                                     (requestedSchema
+                                      . ((type . "object")
+                                         (properties . ((question_0 . ((type . "string")
+                                                                       (oneOf . [((const . "JWT") (title . "JWT"))
+                                                                                 ((const . "Session") (title . "Session"))])))))))))))
+          (should-not responses)
+          (should (equal "elicitation/create" (map-elt state :last-entry-type)))
+          (let ((elicitation (map-elt (map-elt state :elicitations) 9)))
+            (should elicitation)
+            (should (equal "Which auth approach?" (map-elt elicitation :message)))
+            (should (equal "toolu_1" (map-elt elicitation :tool-call-id)))
+            (should (equal 1 (length (map-elt elicitation :fields))))
+            (should-not (map-elt elicitation :answers))))))))
+
+(ert-deftest agent-shell--on-request-handles-sessionless-elicitation-test ()
+  "Test an elicitation outside a session is handled.
+
+A request raised during authentication or configuration carries a
+`requestId' and no `sessionId' or `toolCallId'."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--on-request
+           :state state
+           :acp-request '((id . 10)
+                          (method . "elicitation/create")
+                          (params . ((mode . "form")
+                                     (requestId . "req-abc")
+                                     (message . "Which key?")
+                                     (requestedSchema
+                                      . ((type . "object")
+                                         (properties . ((question_0 . ((type . "string")
+                                                                       (oneOf . [((const . "a") (title . "a"))])))))))))))
+          (should-not responses)
+          (let ((elicitation (map-elt (map-elt state :elicitations) 10)))
+            (should elicitation)
+            (should-not (map-elt elicitation :tool-call-id))))))))
+
+(ert-deftest agent-shell--on-request-elicitation-error-responds-test ()
+  "Test a rendering failure answers the request with an internal error.
+
+`acp.el' swallows an error raised in a request handler and the agent
+applies no timeout, so an unanswered request would block its tool call."
+  (with-temp-buffer
+    (let ((responses nil)
+          (state (agent-shell-tests--elicitation-state (current-buffer))))
+      (agent-shell-tests--with-elicitation-stubs responses
+        (cl-letf (((symbol-function 'agent-shell--render-elicitation)
+                   (lambda (&rest _) (error "Boom"))))
+          (agent-shell--on-request
+           :state state
+           :acp-request '((id . 11)
+                          (method . "elicitation/create")
+                          (params . ((mode . "form")
+                                     (message . "Which?")
+                                     (requestedSchema
+                                      . ((type . "object")
+                                         (properties . ((question_0 . ((type . "string")
+                                                                       (oneOf . [((const . "a") (title . "a"))])))))))))))
+          (should (equal 1 (length responses)))
+          (should (equal 11 (map-elt (car responses) :request-id)))
+          (should (equal -32603 (map-nested-elt (car responses) '(:error code))))
+          (should-not (map-elt state :elicitations)))))))
+
+(ert-deftest agent-shell--on-request-emits-elicitation-request-event-test ()
+  "Test `agent-shell--on-request' emits an elicitation-request event."
+  (let* ((received-events nil)
+         (state (agent-shell-tests--elicitation-state (current-buffer)))
+         (agent-shell--state state))
+    (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+      (agent-shell-tests--with-elicitation-stubs nil
+        (agent-shell-subscribe-to
+         :shell-buffer (current-buffer)
+         :event 'elicitation-request
+         :on-event (lambda (event) (push event received-events)))
+        (agent-shell--on-request
+         :state state
+         :acp-request '((id . 12)
+                        (method . "elicitation/create")
+                        (params . ((mode . "form")
+                                   (toolCallId . "toolu_2")
+                                   (message . "Which?")
+                                   (requestedSchema
+                                    . ((type . "object")
+                                       (properties . ((question_0 . ((type . "string")
+                                                                     (oneOf . [((const . "a") (title . "a"))])))))))))))
+        (should (equal 1 (length received-events)))
+        (let ((data (map-elt (car received-events) :data)))
+          (should (equal 12 (map-elt data :request-id)))
+          (should (equal "toolu_2" (map-elt data :tool-call-id)))
+          (should (equal 1 (length (map-elt data :fields)))))))))
+
+(ert-deftest agent-shell--answer-elicitation-accepts-with-option-label-test ()
+  "Test answering the last question sends the option label as content.
+
+The agent validates accepted content and falls back to empty answers on a
+mismatch, so the content values must be plain strings."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            '((13 . ((:message . "Which auth approach?")
+                     (:fields . (((:name . question_0)
+                                  (:options . (((:value . "JWT") (:title . "JWT")))))))
+                     (:answers . nil)
+                     (:tool-call-id . "toolu_3")))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--answer-elicitation
+           :state state
+           :request-id 13
+           :client 'test-client
+           :field-name 'question_0
+           :value "JWT")
+          (should (equal 1 (length responses)))
+          (should (equal "accept" (map-nested-elt (car responses) '(:result action))))
+          (should (equal "JWT" (map-nested-elt (car responses) '(:result content question_0))))
+          (should-not (map-elt state :elicitations)))))))
+
+(ert-deftest agent-shell--answer-elicitation-waits-for-remaining-question-test ()
+  "Test answering one of two questions re-renders instead of submitting."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (rendered 0)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            '((14 . ((:message . "Answer these")
+                     (:fields . (((:name . question_0)
+                                  (:options . (((:value . "a") (:title . "a")))))
+                                 ((:name . question_1)
+                                  (:options . (((:value . "b") (:title . "b")))))))
+                     (:answers . nil)))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation)
+                 (lambda (&rest _) (setq rendered (1+ rendered)))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--answer-elicitation
+           :state state
+           :request-id 14
+           :client 'test-client
+           :field-name 'question_0
+           :value "a")
+          (should-not responses)
+          (should (equal 1 rendered))
+          (should (equal "a" (map-nested-elt state '(:elicitations 14 :answers question_0)))))))))
+
+(ert-deftest agent-shell--send-elicitation-response-declines-test ()
+  "Test a skipped form sends a decline and clears its state."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            '((15 . ((:fields . (((:name . question_0)))) (:answers . nil)))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--send-elicitation-response
+           :client 'test-client
+           :request-id 15
+           :action "decline"
+           :state state)
+          (should (equal 1 (length responses)))
+          (should (equal "decline" (map-nested-elt (car responses) '(:result action))))
+          (should-not (map-nested-elt (car responses) '(:result content)))
+          (should-not (map-elt state :elicitations)))))))
+
+(ert-deftest agent-shell--send-elicitation-response-cancels-test ()
+  "Test a cancelled form sends a cancel action.
+
+An interrupt still has to answer the request; the agent awaits a response
+to a cancelled request and then fails the tool call."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            '((16 . ((:fields . (((:name . question_0)))) (:answers . nil)))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--send-elicitation-response
+           :client 'test-client
+           :request-id 16
+           :action "cancel"
+           :state state)
+          (should (equal "cancel" (map-nested-elt (car responses) '(:result action))))
+          (should-not (map-elt state :elicitations)))))))
+
+(ert-deftest agent-shell--elicitation-pending-p-test ()
+  "Test `agent-shell--elicitation-pending-p' reports a waiting form."
+  (with-temp-buffer
+    (let* ((state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (should-not (agent-shell--elicitation-pending-p))
+        (setf (map-elt state :elicitations) '((17 . ((:answers . nil)))))
+        (should (agent-shell--elicitation-pending-p))
+        (should (agent-shell--elicitation-pending-p :request-id 17))
+        (should-not (agent-shell--elicitation-pending-p :request-id 99))))))
+
 (ert-deftest agent-shell-restart-preserves-default-directory ()
   "Restart should use the shell's directory, not the fallback buffer's.
 

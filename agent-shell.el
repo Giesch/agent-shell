@@ -117,6 +117,11 @@ You may use \"􀇾\" as an SF Symbol on macOS."
   :type 'string
   :group 'agent-shell)
 
+(defcustom agent-shell-elicitation-icon "⁇"
+  "Icon displayed when an agent asks the user a question."
+  :type 'string
+  :group 'agent-shell)
+
 (defcustom agent-shell-thought-process-icon "✶"
   "Icon displayed during the AI's thought process.
 
@@ -478,6 +483,19 @@ passed through to `acp-make-client'."
 
 (defcustom agent-shell-text-file-capabilities t
   "Whether agents are initialized with read/write text file capabilities.
+
+See `acp-make-initialize-request' for details."
+  :type 'boolean
+  :group 'agent-shell)
+
+(defcustom agent-shell-elicitation-capability t
+  "Whether agents are initialized with the elicitation form capability.
+
+Agents gate question-asking tools on this capability.  Claude Code only
+offers `AskUserQuestion' when it is advertised.
+
+The ACP elicitation capability is unstable, so this is a switch to turn
+off if a future agent release changes its shape.
 
 See `acp-make-initialize-request' for details."
   :type 'boolean
@@ -1203,6 +1221,7 @@ OUTGOING-REQUEST-DECORATOR (passed through to `acp-make-client')."
         (cons :request-count 0)
         (cons :last-activity-time nil)
         (cons :tool-calls nil)
+        (cons :elicitations nil)
         (cons :available-commands nil)
         (cons :available-modes nil)
         (cons :supports-session-list nil)
@@ -2018,18 +2037,29 @@ When nil, check if any permission request is pending."
                   (map-elt (cdr entry) :permission-request-id))
                 (map-elt (agent-shell--state) :tool-calls)))))
 
+(cl-defun agent-shell--elicitation-pending-p (&key shell-buffer request-id)
+  "Return non-nil if an elicitation request is pending.
+When SHELL-BUFFER is non-nil, check that buffer instead of the current one.
+When REQUEST-ID is non-nil, check only that specific request.
+When nil, check if any elicitation request is pending."
+  (with-current-buffer (or shell-buffer (current-buffer))
+    (if request-id
+        (map-elt (map-elt (agent-shell--state) :elicitations) request-id)
+      (and (map-elt (agent-shell--state) :elicitations) t))))
+
 (cl-defun agent-shell-status (&key shell-buffer)
   "Return the status of the agent shell as a symbol.
 When SHELL-BUFFER is non-nil, check that buffer instead of the current one.
 
 Returns one of:
   `busy'    - Agent is actively processing.
-  `blocked' - Agent is waiting for a permission response.
+  `blocked' - Agent is waiting for a permission or elicitation response.
   `ready'   - Agent is idle and ready for input."
   (with-current-buffer (or shell-buffer (current-buffer))
     (cond
      ((and (shell-maker-busy)
-           (agent-shell--permission-pending-p)) 'blocked)
+           (or (agent-shell--permission-pending-p)
+               (agent-shell--elicitation-pending-p))) 'blocked)
      (t
       (if (shell-maker-busy)
           'busy
@@ -2056,6 +2086,15 @@ See also `agent-shell-confirm-interrupt'."
                  :state (agent-shell--state)
                  :tool-call-id tool-call-id)))
             (map-elt (agent-shell--state) :tool-calls))
+           ;; Cancel any pending elicitation too. A cancelled request still
+           ;; needs its JSON-RPC response; the agent awaits it regardless.
+           ;; Ids are collected up front: responding deletes the entry.
+           (dolist (request-id (map-keys (map-elt (agent-shell--state) :elicitations)))
+             (agent-shell--send-elicitation-response
+              :client (map-elt (agent-shell--state) :client)
+              :request-id request-id
+              :action "cancel"
+              :state (agent-shell--state)))
            ;; Then send the cancel notification
            (acp-send-notification
             :client (map-elt (agent-shell--state) :client)
@@ -2377,12 +2416,13 @@ active label function still has nothing to summarize (an empty group).")
 
 (defconst agent-shell--activity-group-run-entry-types
   '("tool_call" "tool_call_update" "session/request_permission"
-    "agent_thought_chunk")
+    "elicitation/create" "agent_thought_chunk")
   "Entry types that keep the current activity run open.
 Consecutive tool calls and thoughts share one activity group; any other
 rendered entry between them (e.g. a streamed message) starts a fresh one.
-A permission request is part of a tool call's own flow (its dialog is
-transient, deleted on completion), so it must not break the run.")
+A permission request and an elicitation form are part of a tool call's own
+flow (their dialogs are transient, deleted on completion), so they must not
+break the run.")
 
 (defun agent-shell--activity-group-current-id (state)
   "Return the current activity group id for STATE, advancing on a new run.
@@ -3333,6 +3373,10 @@ Clears STATE's `:expanded-activity-group'."
          (agent-shell-experimental--on-session-push-request
           :state state
           :acp-request acp-request))
+        ((equal (map-elt acp-request 'method) "elicitation/create")
+         (agent-shell--on-elicitation-create-request
+          :state state
+          :acp-request acp-request))
         (t
          (let ((method (map-elt acp-request 'method)))
            (agent-shell--update-fragment
@@ -3944,6 +3988,17 @@ DIFFS is a list of diff infos as returned by
               (map-merge 'alist old-tool-call tool-call-overrides)
             tool-call-overrides))
     (map-put! state :tool-calls updated-tools)))
+
+(defun agent-shell--save-elicitation (state request-id elicitation)
+  "Store ELICITATION with REQUEST-ID in STATE's :elicitations alist."
+  (let ((updated (copy-alist (map-elt state :elicitations))))
+    (setf (map-elt updated request-id) elicitation)
+    (map-put! state :elicitations updated)))
+
+(defun agent-shell--delete-elicitation (state request-id)
+  "Remove the elicitation with REQUEST-ID from STATE's :elicitations alist."
+  (map-put! state :elicitations
+            (map-delete (copy-alist (map-elt state :elicitations)) request-id)))
 
 (cl-defun agent-shell--make-boxed-message (&key text width)
   "Return TEXT framed in a rounded Unicode box.
@@ -6040,6 +6095,13 @@ Session events:
     :data contains :request-id, :tool-call-id, :tool-call
   `permission-response'   - Permission response sent
     :data contains :request-id, :tool-call-id, :option-id, :cancelled
+  `elicitation-request'   - Elicitation form displayed to user
+    :data contains :request-id, :tool-call-id (nil outside a tool call),
+    and :fields (the rendered questions)
+  `elicitation-response'  - Elicitation response sent
+    :data contains :request-id, :tool-call-id, :action (\"accept\",
+    \"decline\", or \"cancel\"), and :answers (field name to chosen option,
+    nil unless the action is \"accept\")
   `agent-message-chunk'   - Agent streamed a chunk of message text
     :data contains :text-chunk (the raw text the agent emitted, nil for a
     non-text block such as an image).  Emitted once per streamed chunk, so
@@ -6328,7 +6390,8 @@ Must provide ON-INITIATED (lambda ())."
                             (title . "Emacs Agent Shell")
                             (version . ,agent-shell--version))
              :read-text-file-capability agent-shell-text-file-capabilities
-             :write-text-file-capability agent-shell-text-file-capabilities)
+             :write-text-file-capability agent-shell-text-file-capabilities
+             :elicitation-form-capability agent-shell-elicitation-capability)
    :on-success (lambda (acp-response)
                  (with-current-buffer shell-buffer
                    (let ((acp-session-capabilities (or (map-elt acp-response 'sessionCapabilities)
@@ -9095,6 +9158,389 @@ Returns non-nil if a permission button was found, nil otherwise."
     (deactivate-mark)
     (goto-char found)
     found))
+
+;;; Elicitations
+
+(defun agent-shell--elicitation-block-id (request-id)
+  "Return the fragment block id for elicitation REQUEST-ID."
+  (format "elicitation-%s" request-id))
+
+(defun agent-shell--elicitation-option (acp-option)
+  "Make an option from ACP-OPTION for form rendering.
+
+ACP-OPTION is an enum option from a `requestedSchema' field: an object
+with a `const', a `title', and an optional `description'.
+
+Returns an alist with keys :value, :title, and :description, or nil when
+`const' is not a string.  The response sends `const' verbatim, and the
+agent discards content of the wrong type without reporting an error, so a
+non-string makes the form unrenderable."
+  (when-let* ((value (map-elt acp-option 'const))
+              ((stringp value)))
+    (let ((title (map-elt acp-option 'title))
+          (description (map-elt acp-option 'description)))
+      (list (cons :value value)
+            (cons :title (if (stringp title) title value))
+            (cons :description (when (stringp description) description))))))
+
+(defun agent-shell--elicitation-field (name spec)
+  "Make a single-select field named NAME from schema SPEC.
+
+Returns an alist with keys :name, :title, :description, and :options, or
+nil when SPEC is not a single-select string field whose options this shell
+can render."
+  (when-let* (((equal (map-elt spec 'type) "string"))
+              (acp-options (map-elt spec 'oneOf))
+              ((vectorp acp-options))
+              ((> (length acp-options) 0))
+              (options (mapcar #'agent-shell--elicitation-option
+                               (append acp-options nil)))
+              ((not (memq nil options))))
+    (let ((title (map-elt spec 'title))
+          (description (map-elt spec 'description)))
+      (list (cons :name name)
+            (cons :title (when (stringp title) title))
+            (cons :description (when (stringp description) description))
+            (cons :options options)))))
+
+(defun agent-shell--elicitation-form-fields (requested-schema)
+  "Return the renderable fields of REQUESTED-SCHEMA, or `unsupported'.
+
+REQUESTED-SCHEMA is the `requestedSchema' object of an
+\"elicitation/create\" request.  Returns a list of field alists in schema
+order.  See `agent-shell--elicitation-field'.
+
+Returns the symbol `unsupported' when the schema asks for anything this
+shell cannot render: a `required' list, a multi-select field, or a field
+that is not a single-select string.  An unrenderable form is declined,
+which is what the agent falls back to on its own.  Sending a partial
+answer instead would put words in the user's mouth.
+
+A field marked as a custom answer is skipped.  It is an optional
+companion to a question, and no schema listing one marks it required."
+  (if (or (not (listp requested-schema))
+          (map-contains-key requested-schema 'required))
+      'unsupported
+    (catch 'unsupported
+      (let ((fields '()))
+        (map-do
+         (lambda (name spec)
+           (unless (map-nested-elt spec '(_meta _askUserQuestionCustomAnswer))
+             (if-let* ((field (agent-shell--elicitation-field name spec)))
+                 (push field fields)
+               (throw 'unsupported 'unsupported))))
+         (map-elt requested-schema 'properties))
+        (if fields
+            (nreverse fields)
+          'unsupported)))))
+
+(defun agent-shell--elicitation-pending-field (elicitation)
+  "Return the first unanswered field of ELICITATION, or nil."
+  (let ((answers (map-elt elicitation :answers)))
+    (seq-find (lambda (field)
+                (not (map-contains-key answers (map-elt field :name))))
+              (map-elt elicitation :fields))))
+
+(defun agent-shell--elicitation-complete-p (elicitation)
+  "Return non-nil when every field in ELICITATION has an answer."
+  (not (agent-shell--elicitation-pending-field elicitation)))
+
+(defun agent-shell--elicitation-field-label (field fallback)
+  "Return the question text for FIELD, or FALLBACK when it carries none.
+
+A field's description is the question.  A single-question schema leaves
+the description out and carries the question in the request's message
+instead, which the caller passes as FALLBACK.  A field's title is a short
+label for the answer (\"Auth\"), not the question, so it comes last."
+  (or (map-elt field :description)
+      fallback
+      (map-elt field :title)
+      (format "%s" (map-elt field :name))))
+
+(cl-defun agent-shell--make-elicitation-answer-command (&key state request-id client field-name value)
+  "Return a command recording VALUE as the answer to FIELD-NAME.
+
+STATE, REQUEST-ID, and CLIENT identify the elicitation to update."
+  (lambda ()
+    (interactive)
+    (agent-shell--answer-elicitation
+     :state state
+     :request-id request-id
+     :client client
+     :field-name field-name
+     :value value)))
+
+(cl-defun agent-shell--make-elicitation-text (&key elicitation request-id client state)
+  "Create text to render the question form for ELICITATION.
+
+REQUEST-ID identifies the elicitation within STATE.  CLIENT is the ACP
+client used to send the response.
+
+An answered question renders as text.  The first unanswered question
+renders its options as buttons, numbered for hotkey access.  Answering the
+last question submits the form.
+
+For example:
+
+   ╭─
+
+       ⁇ Question ⁇
+
+
+       Which auth approach?
+
+       [ JWT (1) ] [ Session (2) ]
+
+       [ Skip (s) ]
+
+
+   ╰─"
+  (let* ((message (map-elt elicitation :message))
+         (fields (map-elt elicitation :fields))
+         (answers (map-elt elicitation :answers))
+         (pending (agent-shell--elicitation-pending-field elicitation))
+         (shell-buffer (map-elt state :buffer))
+         (skip-action (lambda ()
+                        (interactive)
+                        (agent-shell--send-elicitation-response
+                         :client client
+                         :request-id request-id
+                         :action "decline"
+                         :state state)))
+         (keymap (let ((map (make-sparse-keymap)))
+                   (seq-do-indexed
+                    (lambda (option index)
+                      (when (< index 9)
+                        (define-key map (kbd (number-to-string (1+ index)))
+                                    (agent-shell--make-elicitation-answer-command
+                                     :state state
+                                     :request-id request-id
+                                     :client client
+                                     :field-name (map-elt pending :name)
+                                     :value (map-elt option :value)))))
+                    (map-elt pending :options))
+                   (define-key map (kbd "s") skip-action)
+                   ;; Add interrupt keybinding
+                   (define-key map (kbd "C-c C-c")
+                               (lambda ()
+                                 (interactive)
+                                 (with-current-buffer shell-buffer
+                                   (agent-shell-interrupt t))))
+                   map))
+         ;; With one question the message is the question itself.  With
+         ;; several it is a generic lead-in, rendered once as a header.
+         (single (= (length fields) 1))
+         (rows (mapcar
+                (lambda (field)
+                  (let ((label (propertize (agent-shell--elicitation-field-label
+                                            field (when single message))
+                                           'font-lock-face 'agent-shell-input))
+                        (answer (map-elt answers (map-elt field :name))))
+                    (cond
+                     (answer
+                      (format "%s\n\n    %s" label
+                              (propertize answer 'font-lock-face 'agent-shell-section-annotation)))
+                     ((eq field pending)
+                      (format "%s\n\n    %s" label
+                              (string-join
+                               (seq-map-indexed
+                                (lambda (option index)
+                                  (let ((hotkey (when (< index 9)
+                                                  (number-to-string (1+ index)))))
+                                    (agent-shell--make-permission-button
+                                     :text (if hotkey
+                                               (format "%s (%s)" (map-elt option :title) hotkey)
+                                             (map-elt option :title))
+                                     :help (or (map-elt option :description)
+                                               (map-elt option :title))
+                                     :action (agent-shell--make-elicitation-answer-command
+                                              :state state
+                                              :request-id request-id
+                                              :client client
+                                              :field-name (map-elt field :name)
+                                              :value (map-elt option :value))
+                                     :keymap keymap
+                                     :navigatable t
+                                     :char hotkey
+                                     :option (format "answer %s" (map-elt option :title)))))
+                                (map-elt field :options))
+                               " ")))
+                     (t label))))
+                fields)))
+    (format "╭─
+
+    %s %s %s%s
+
+
+    %s
+
+
+╰─"
+            (propertize agent-shell-elicitation-icon
+                        'font-lock-face 'agent-shell-warning)
+            (propertize "Question" 'font-lock-face 'agent-shell-permission-title)
+            (propertize agent-shell-elicitation-icon
+                        'font-lock-face 'agent-shell-warning)
+            (if single
+                ""
+              (format "\n\n\n    %s"
+                      (propertize (or message "") 'font-lock-face 'agent-shell-input)))
+            (string-join
+             (append rows
+                     (list (agent-shell--make-permission-button
+                            :text "Skip (s)"
+                            :help "Press s to skip"
+                            :action skip-action
+                            :keymap keymap
+                            :navigatable t
+                            :char "s"
+                            :option "skip")))
+             "\n\n    "))))
+
+(cl-defun agent-shell--render-elicitation (&key state request-id client)
+  "Render the form for elicitation REQUEST-ID in STATE.
+
+CLIENT is the ACP client used to send the response.  Re-rendering reuses
+the same block id, so a recorded answer replaces the form in place."
+  (when-let* ((elicitation (map-elt (map-elt state :elicitations) request-id)))
+    (agent-shell--update-fragment
+     :state state
+     :block-id (agent-shell--elicitation-block-id request-id)
+     :body (with-current-buffer (map-elt state :buffer)
+             (agent-shell--make-elicitation-text
+              :elicitation elicitation
+              :request-id request-id
+              :client client
+              :state state))
+     :expanded t
+     :navigation 'never
+     :above-last-prompt (not (agent-shell--active-requests-p state)))
+    (with-current-buffer (map-elt state :buffer)
+      (agent-shell-jump-to-latest-permission-button-row))
+    (when-let* ((viewport-buffer (agent-shell-viewport--buffer
+                                 :shell-buffer (map-elt state :buffer)
+                                 :existing-only t)))
+      (with-current-buffer viewport-buffer
+        (agent-shell-jump-to-latest-permission-button-row)))))
+
+(cl-defun agent-shell--answer-elicitation (&key state request-id client field-name value)
+  "Record VALUE as the answer to FIELD-NAME in elicitation REQUEST-ID.
+
+Re-renders the form while questions remain, and sends the answers once the
+last question is answered.  STATE is the buffer-local session state and
+CLIENT is the ACP client used to send the response."
+  (with-current-buffer (map-elt state :buffer)
+    (when-let* ((elicitation (map-elt (map-elt state :elicitations) request-id))
+                (updated (map-insert elicitation :answers
+                                     (map-insert (map-elt elicitation :answers)
+                                                 field-name value))))
+      (agent-shell--save-elicitation state request-id updated)
+      (if (agent-shell--elicitation-complete-p updated)
+          (agent-shell--send-elicitation-response
+           :client client
+           :request-id request-id
+           :action "accept"
+           :content (map-elt updated :answers)
+           :state state)
+        (agent-shell--render-elicitation
+         :state state
+         :request-id request-id
+         :client client)))))
+
+(cl-defun agent-shell--send-elicitation-response (&key client request-id action content state)
+  "Send ACTION as the response to elicitation REQUEST-ID and clean up its UI.
+
+CLIENT is the ACP client used to send the response.
+REQUEST-ID is the id of the original elicitation request.
+ACTION is \"accept\", \"decline\", or \"cancel\".
+CONTENT is the answers alist, valid with an \"accept\" ACTION only.
+STATE is the buffer-local session state."
+  (let ((tool-call-id (map-nested-elt state (list :elicitations request-id :tool-call-id)))
+        (answers (when (equal action "accept") content)))
+    (acp-send-response
+     :client client
+     :response (acp-make-elicitation-create-response
+                :request-id request-id
+                :action action
+                :content answers))
+    ;; Ensure in the shell buffer for state operations, as this
+    ;; function may be invoked from a viewport buffer.
+    (with-current-buffer (map-elt state :buffer)
+      ;; block-id must be the same as the one used as
+      ;; agent-shell--update-fragment param by "elicitation/create".
+      (agent-shell--delete-fragment
+       :state state
+       :block-id (agent-shell--elicitation-block-id request-id))
+      (agent-shell--delete-elicitation state request-id)
+      (agent-shell--cancel-idle-timer)
+      (agent-shell--emit-event
+       :event 'elicitation-response
+       :data (list (cons :request-id request-id)
+                   (cons :tool-call-id tool-call-id)
+                   (cons :action action)
+                   (cons :answers answers)))
+      ;; Jump to any remaining button row, or go to end of buffer.
+      (or (agent-shell-jump-to-latest-permission-button-row)
+          (goto-char (point-max)))
+      (when-let* ((viewport-buffer (agent-shell-viewport--buffer
+                                   :shell-buffer (map-elt state :buffer)
+                                   :existing-only t)))
+        (with-current-buffer viewport-buffer
+          (or (agent-shell-jump-to-latest-permission-button-row)
+              (goto-char (point-max))))))))
+
+(cl-defun agent-shell--on-elicitation-create-request (&key state acp-request)
+  "Handle an \"elicitation/create\" ACP-REQUEST using STATE.
+
+Renders a form of single-select questions, and declines any request this
+shell cannot render.  A url-mode request and an unsupported schema are
+both declined rather than failed: the agent treats a decline as the user
+skipping the questions and carries on.
+
+Every path answers the request.  `acp.el' swallows an error raised here
+and the agent applies no timeout, so an unanswered request would block its
+tool call with nothing on screen to show why."
+  (let ((request-id (map-elt acp-request 'id))
+        (client (map-elt state :client)))
+    (condition-case-unless-debug err
+        (let ((fields (when (equal (map-nested-elt acp-request '(params mode)) "form")
+                        (agent-shell--elicitation-form-fields
+                         (map-nested-elt acp-request '(params requestedSchema))))))
+          (if (or (null fields)
+                  (eq fields 'unsupported))
+              (acp-send-response
+               :client client
+               :response (acp-make-elicitation-create-response
+                          :request-id request-id
+                          :action "decline"))
+            (let ((tool-call-id (map-nested-elt acp-request '(params toolCallId))))
+              (agent-shell--save-elicitation
+               state request-id
+               (list (cons :message (map-nested-elt acp-request '(params message)))
+                     (cons :fields fields)
+                     (cons :answers nil)
+                     (cons :tool-call-id tool-call-id)))
+              (agent-shell--render-elicitation
+               :state state
+               :request-id request-id
+               :client client)
+              (let ((data (list (cons :request-id request-id)
+                                (cons :tool-call-id tool-call-id)
+                                (cons :fields fields))))
+                (agent-shell--emit-event
+                 :event 'elicitation-request
+                 :data data)
+                (agent-shell--start-idle-timer :event 'elicitation-request :data data))
+              (map-put! state :last-entry-type "elicitation/create"))))
+      (error
+       (agent-shell--delete-elicitation state request-id)
+       (acp-send-response
+        :client client
+        :response `((:request-id . ,request-id)
+                    (:error . ,(acp-make-error
+                                :code -32603
+                                :message (format "Failed to render elicitation: %s"
+                                                 (error-message-string err))))))))))
 
 ;;; Region
 
