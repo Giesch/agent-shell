@@ -9308,9 +9308,15 @@ STATE, REQUEST-ID, and CLIENT identify the elicitation to update."
 REQUEST-ID identifies the elicitation within STATE.  CLIENT is the ACP
 client used to send the response.
 
-An answered question renders as text.  The first unanswered question
-renders its options as buttons, numbered for hotkey access.  Answering the
-last question submits the form.
+Every question renders its options as buttons, numbered for hotkey
+access.  The chosen option of a question is marked, and choosing another
+option replaces it.  A form of two or more questions carries a Submit
+button and sends the answers when it is pressed.  A one-question form
+carries no Submit and sends on the choice itself.
+
+Point lands on the first option of the first unanswered question, or on
+Submit once every question is answered.  See
+`agent-shell--jump-to-focus-button'.
 
 For example:
 
@@ -9319,11 +9325,18 @@ For example:
        ⁇ Question ⁇
 
 
+       I need two decisions first.
+
+
        Which auth approach?
 
-       [ JWT (1) ] [ Session (2) ]
+       [ ✓ JWT (1) ] [ □ Session (2) ]
 
-       [ Skip (s) ]
+       Which database?
+
+       [ □ Postgres (1) ] [ □ SQLite (2) ]
+
+       [ Submit (c) ] [ Skip (s) ]
 
 
    ╰─"
@@ -9331,6 +9344,9 @@ For example:
          (fields (map-elt elicitation :fields))
          (answers (map-elt elicitation :answers))
          (pending (agent-shell--elicitation-pending-field elicitation))
+         ;; With one question the message is the question itself.  With
+         ;; several it is a generic lead-in, rendered once as a header.
+         (single (= (length fields) 1))
          (shell-buffer (map-elt state :buffer))
          (skip-action (lambda ()
                         (interactive)
@@ -9339,19 +9355,23 @@ For example:
                          :request-id request-id
                          :action "decline"
                          :state state)))
+         (submit-action (lambda ()
+                          (interactive)
+                          (agent-shell--submit-elicitation
+                           :state state
+                           :request-id request-id
+                           :client client)))
+         ;; Every question is answerable at once, so a digit is only
+         ;; unambiguous within one question.  Each question gets a child
+         ;; of this map binding its own digits.  The map rides on the
+         ;; button as a text property, so point picks the question.
          (keymap (let ((map (make-sparse-keymap)))
-                   (seq-do-indexed
-                    (lambda (option index)
-                      (when (< index 9)
-                        (define-key map (kbd (number-to-string (1+ index)))
-                                    (agent-shell--make-elicitation-answer-command
-                                     :state state
-                                     :request-id request-id
-                                     :client client
-                                     :field-name (map-elt pending :name)
-                                     :value (map-elt option :value)))))
-                    (map-elt pending :options))
                    (define-key map (kbd "s") skip-action)
+                   ;; A one-question form renders no Submit button, and an
+                   ;; unscoped "c" there would accept from an
+                   ;; unadvertised key.
+                   (unless single
+                     (define-key map (kbd "c") submit-action))
                    ;; Add interrupt keybinding
                    (define-key map (kbd "C-c C-c")
                                (lambda ()
@@ -9359,46 +9379,62 @@ For example:
                                  (with-current-buffer shell-buffer
                                    (agent-shell-interrupt t))))
                    map))
-         ;; With one question the message is the question itself.  With
-         ;; several it is a generic lead-in, rendered once as a header.
-         (single (= (length fields) 1))
          (rows (mapcar
                 (lambda (field)
                   (let ((label (propertize (agent-shell--elicitation-field-label
                                             field (when single message))
                                            'font-lock-face 'agent-shell-input))
-                        (answer (map-elt answers (map-elt field :name))))
-                    (cond
-                     (answer
-                      (format "%s\n\n    %s" label
-                              (propertize answer 'font-lock-face 'agent-shell-section-annotation)))
-                     ((eq field pending)
-                      (format "%s\n\n    %s" label
-                              (string-join
-                               (seq-map-indexed
-                                (lambda (option index)
-                                  (let ((hotkey (when (< index 9)
-                                                  (number-to-string (1+ index)))))
-                                    (agent-shell--make-permission-button
-                                     :text (if hotkey
-                                               (format "%s (%s)" (map-elt option :title) hotkey)
+                        (answer (map-elt answers (map-elt field :name)))
+                        (field-keymap (make-sparse-keymap)))
+                    (set-keymap-parent field-keymap keymap)
+                    (seq-do-indexed
+                     (lambda (option index)
+                       (when (< index 9)
+                         (define-key field-keymap (kbd (number-to-string (1+ index)))
+                                     (agent-shell--make-elicitation-answer-command
+                                      :state state
+                                      :request-id request-id
+                                      :client client
+                                      :field-name (map-elt field :name)
+                                      :value (map-elt option :value)))))
+                     (map-elt field :options))
+                    (format "%s\n\n    %s" label
+                            (string-join
+                             (seq-map-indexed
+                              (lambda (option index)
+                                (let ((hotkey (when (< index 9)
+                                                (number-to-string (1+ index))))
+                                      ;; A glyph rather than a face: the
+                                      ;; button frame is a box in a
+                                      ;; graphical frame and brackets in a
+                                      ;; terminal, so a background colour
+                                      ;; would not read the same in both.
+                                      (glyph (if (equal answer (map-elt option :value))
+                                                 agent-shell-markdown-list-checkbox-checked
+                                               agent-shell-markdown-list-checkbox-unchecked)))
+                                  (agent-shell--make-permission-button
+                                   ;; The hotkey stays last:
+                                   ;; `agent-shell--make-permission-button'
+                                   ;; derives the navigatable character
+                                   ;; from the trailing "(x)".
+                                   :text (if hotkey
+                                             (format "%s %s (%s)" glyph (map-elt option :title) hotkey)
+                                           (format "%s %s" glyph (map-elt option :title)))
+                                   :help (or (map-elt option :description)
                                              (map-elt option :title))
-                                     :help (or (map-elt option :description)
-                                               (map-elt option :title))
-                                     :action (agent-shell--make-elicitation-answer-command
-                                              :state state
-                                              :request-id request-id
-                                              :client client
-                                              :field-name (map-elt field :name)
-                                              :value (map-elt option :value))
-                                     :keymap keymap
-                                     :navigatable t
-                                     :char hotkey
-                                     :focus (= index 0)
-                                     :option (format "answer %s" (map-elt option :title)))))
-                                (map-elt field :options))
-                               " ")))
-                     (t label))))
+                                   :action (agent-shell--make-elicitation-answer-command
+                                            :state state
+                                            :request-id request-id
+                                            :client client
+                                            :field-name (map-elt field :name)
+                                            :value (map-elt option :value))
+                                   :keymap field-keymap
+                                   :navigatable t
+                                   :char hotkey
+                                   :focus (and (eq field pending) (= index 0))
+                                   :option (format "answer %s" (map-elt option :title)))))
+                              (map-elt field :options))
+                             " "))))
                 fields)))
     (format "╭─
 
@@ -9420,14 +9456,27 @@ For example:
                       (propertize (or message "") 'font-lock-face 'agent-shell-input)))
             (string-join
              (append rows
-                     (list (agent-shell--make-permission-button
-                            :text "Skip (s)"
-                            :help "Press s to skip"
-                            :action skip-action
-                            :keymap keymap
-                            :navigatable t
-                            :char "s"
-                            :option "skip")))
+                     (list (string-join
+                            (append
+                             (unless single
+                               (list (agent-shell--make-permission-button
+                                      :text "Submit (c)"
+                                      :help "Press c to submit"
+                                      :action submit-action
+                                      :keymap keymap
+                                      :navigatable t
+                                      :char "c"
+                                      :focus (null pending)
+                                      :option "submit")))
+                             (list (agent-shell--make-permission-button
+                                    :text "Skip (s)"
+                                    :help "Press s to skip"
+                                    :action skip-action
+                                    :keymap keymap
+                                    :navigatable t
+                                    :char "s"
+                                    :option "skip")))
+                            " ")))
              "\n\n    "))))
 
 (cl-defun agent-shell--render-elicitation (&key state request-id client)
@@ -9459,26 +9508,48 @@ the same block id, so a recorded answer replaces the form in place."
 (cl-defun agent-shell--answer-elicitation (&key state request-id client field-name value)
   "Record VALUE as the answer to FIELD-NAME in elicitation REQUEST-ID.
 
-Re-renders the form while questions remain, and sends the answers once the
-last question is answered.  STATE is the buffer-local session state and
-CLIENT is the ACP client used to send the response."
+Re-renders the form, so the answer can be replaced until it is submitted.
+A one-question form sends the answer instead: its single choice is the
+submit, and it renders no Submit button.
+
+STATE is the buffer-local session state and CLIENT is the ACP client used
+to send the response."
   (with-current-buffer (map-elt state :buffer)
     (when-let* ((elicitation (map-elt (map-elt state :elicitations) request-id))
                 (updated (map-insert elicitation :answers
                                      (map-insert (map-elt elicitation :answers)
                                                  field-name value))))
       (agent-shell--save-elicitation state request-id updated)
-      (if (agent-shell--elicitation-complete-p updated)
-          (agent-shell--send-elicitation-response
-           :client client
+      (if (and (= (length (map-elt updated :fields)) 1)
+               (agent-shell--elicitation-complete-p updated))
+          (agent-shell--submit-elicitation
+           :state state
            :request-id request-id
-           :action "accept"
-           :content (map-elt updated :answers)
-           :state state)
+           :client client)
         (agent-shell--render-elicitation
          :state state
          :request-id request-id
          :client client)))))
+
+(cl-defun agent-shell--submit-elicitation (&key state request-id client)
+  "Send the answers recorded for elicitation REQUEST-ID as an accept.
+
+STATE is the buffer-local session state and CLIENT is the ACP client used
+to send the response.
+
+An unanswered question is left out.  The schema carries no required list,
+so a partial accept is legal, and submitting with no answers at all sends
+empty content, which the agent reads as a skip."
+  (with-current-buffer (map-elt state :buffer)
+    (agent-shell--send-elicitation-response
+     :client client
+     :request-id request-id
+     :action "accept"
+     ;; Read from STATE rather than from an elicitation the render closed
+     ;; over.  `agent-shell--save-elicitation' stores a fresh copy on
+     ;; every answer.
+     :content (map-nested-elt state (list :elicitations request-id :answers))
+     :state state)))
 
 (cl-defun agent-shell--send-elicitation-response (&key client request-id action content state)
   "Send ACTION as the response to elicitation REQUEST-ID and clean up its UI.

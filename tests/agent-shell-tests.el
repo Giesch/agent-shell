@@ -4211,6 +4211,39 @@ first."
              ((symbol-function 'agent-shell-viewport--buffer) (lambda (&rest _) nil)))
      ,@body))
 
+(defun agent-shell-tests--one-question-elicitation (&optional answers)
+  "Return a one-question elicitation carrying ANSWERS.
+
+Built with `list' and `cons' rather than a backquote: a quoted literal
+shares its constant tail across calls, which leaks answers from one test
+into the next."
+  (list (cons :message "Which auth approach?")
+        (cons :fields
+              (list (list (cons :name 'question_0)
+                          (cons :options
+                                (list (list (cons :value "JWT") (cons :title "JWT"))
+                                      (list (cons :value "Session") (cons :title "Session")))))))
+        (cons :answers answers)
+        (cons :tool-call-id "toolu_1")))
+
+(defun agent-shell-tests--two-question-elicitation (&optional answers)
+  "Return a two-question elicitation carrying ANSWERS.
+
+See `agent-shell-tests--one-question-elicitation' on why this is built
+with `list' and `cons'."
+  (list (cons :message "Answer these")
+        (cons :fields
+              (list (list (cons :name 'question_0)
+                          (cons :options
+                                (list (list (cons :value "JWT") (cons :title "JWT"))
+                                      (list (cons :value "Session") (cons :title "Session")))))
+                    (list (cons :name 'question_1)
+                          (cons :options
+                                (list (list (cons :value "Postgres") (cons :title "Postgres"))
+                                      (list (cons :value "SQLite") (cons :title "SQLite")))))))
+        (cons :answers answers)
+        (cons :tool-call-id "toolu_1")))
+
 (defun agent-shell-tests--elicitation-text (elicitation)
   "Return the rendered form text for ELICITATION.
 
@@ -4506,44 +4539,194 @@ to a cancelled request and then fails the tool call."
 no mark it falls back to the last button row, which is Skip, and a blind
 `RET' would decline the form."
   (with-temp-buffer
-    (let* ((elicitation
-            (list (cons :message "Which auth approach?")
-                  (cons :fields
-                        (list (list (cons :name 'question_0)
-                                    (cons :options
-                                          (list (list (cons :value "JWT")
-                                                      (cons :title "JWT"))
-                                                (list (cons :value "Session")
-                                                      (cons :title "Session")))))))
-                  (cons :answers nil)))
-           (text (agent-shell-tests--elicitation-text elicitation))
+    (let* ((text (agent-shell-tests--elicitation-text
+                  (agent-shell-tests--one-question-elicitation)))
            (pos (agent-shell-tests--focus-button-position text)))
       (should pos)
       ;; The focused character is the one the navigation commands stop on.
       (should (get-text-property pos 'agent-shell-permission-button text))
-      (should (equal "[ JWT (1) ]" (agent-shell-tests--focus-button-text text)))
+      (should (equal (format "[ %s JWT (1) ]" agent-shell-markdown-list-checkbox-unchecked)
+                     (agent-shell-tests--focus-button-text text)))
       ;; Exactly one character is marked, so Skip cannot be carrying it.
       (should-not (agent-shell-tests--focus-button-position text (1+ pos))))))
 
 (ert-deftest agent-shell--make-elicitation-text-focuses-pending-question-test ()
-  "Test the form marks the first unanswered question for focus."
+  "Test the form marks the first unanswered question for focus.
+
+Answering out of order walks point back to the earliest gap."
   (with-temp-buffer
-    (let* ((elicitation
-            (list (cons :message "Answer these")
-                  (cons :fields
-                        (list (list (cons :name 'question_0)
-                                    (cons :options
-                                          (list (list (cons :value "JWT")
-                                                      (cons :title "JWT")))))
-                              (list (cons :name 'question_1)
-                                    (cons :options
-                                          (list (list (cons :value "Postgres")
-                                                      (cons :title "Postgres"))
-                                                (list (cons :value "SQLite")
-                                                      (cons :title "SQLite")))))))
-                  (cons :answers (list (cons 'question_0 "JWT")))))
-           (text (agent-shell-tests--elicitation-text elicitation)))
-      (should (equal "[ Postgres (1) ]" (agent-shell-tests--focus-button-text text))))))
+    (let ((text (agent-shell-tests--elicitation-text
+                 (agent-shell-tests--two-question-elicitation
+                  (list (cons 'question_1 "SQLite"))))))
+      (should (equal (format "[ %s JWT (1) ]" agent-shell-markdown-list-checkbox-unchecked)
+                     (agent-shell-tests--focus-button-text text))))
+    (let ((text (agent-shell-tests--elicitation-text
+                 (agent-shell-tests--two-question-elicitation
+                  (list (cons 'question_0 "JWT"))))))
+      (should (equal (format "[ %s Postgres (1) ]" agent-shell-markdown-list-checkbox-unchecked)
+                     (agent-shell-tests--focus-button-text text))))))
+
+(ert-deftest agent-shell--make-elicitation-text-focuses-submit-when-answered-test ()
+  "Test focus moves to Submit once every question is answered."
+  (with-temp-buffer
+    (let ((text (agent-shell-tests--elicitation-text
+                 (agent-shell-tests--two-question-elicitation
+                  (list (cons 'question_0 "JWT")
+                        (cons 'question_1 "SQLite"))))))
+      (should (equal "[ Submit (c) ]" (agent-shell-tests--focus-button-text text))))))
+
+(ert-deftest agent-shell--make-elicitation-text-marks-chosen-option-test ()
+  "Test the form marks the chosen option of each question and no other."
+  (with-temp-buffer
+    (let ((text (substring-no-properties
+                 (agent-shell-tests--elicitation-text
+                  (agent-shell-tests--two-question-elicitation
+                   (list (cons 'question_0 "Session"))))))
+          (checked agent-shell-markdown-list-checkbox-checked)
+          (unchecked agent-shell-markdown-list-checkbox-unchecked))
+      (should (string-search (format "[ %s Session (2) ]" checked) text))
+      (should (string-search (format "[ %s JWT (1) ]" unchecked) text))
+      ;; The unanswered question marks nothing.
+      (should (string-search (format "[ %s Postgres (1) ]" unchecked) text))
+      (should (string-search (format "[ %s SQLite (2) ]" unchecked) text))
+      (should-not (string-search checked
+                                 (substring text (string-search "Postgres" text)))))))
+
+(ert-deftest agent-shell--make-elicitation-text-renders-submit-test ()
+  "Test only a form of two or more questions renders Submit.
+
+A one-question form sends on the choice itself, so a Submit button there
+would have nothing to do."
+  (with-temp-buffer
+    (should (string-search
+             "[ Submit (c) ]"
+             (substring-no-properties
+              (agent-shell-tests--elicitation-text
+               (agent-shell-tests--two-question-elicitation)))))
+    (should-not (string-search
+                 "Submit"
+                 (substring-no-properties
+                  (agent-shell-tests--elicitation-text
+                   (agent-shell-tests--one-question-elicitation)))))))
+
+(ert-deftest agent-shell--make-elicitation-text-scopes-digits-per-question-test ()
+  "Test a question's digit hotkeys answer that question.
+
+Every question is answerable at once, so one shared digit binding would be
+ambiguous.  Each question carries a child keymap binding only its own
+digits, and the map rides on the button, so point picks the question."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 24 (agent-shell-tests--two-question-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (let* ((text (agent-shell--make-elicitation-text
+                        :elicitation (map-elt (map-elt state :elicitations) 24)
+                        :request-id 24
+                        :client 'test-client
+                        :state state))
+                 (position (string-search
+                            (format "[ %s SQLite"
+                                    agent-shell-markdown-list-checkbox-unchecked)
+                            (substring-no-properties text))))
+            (should position)
+            (let ((command (lookup-key (get-text-property position 'keymap text) (kbd "2"))))
+              (should (commandp command))
+              (funcall command))
+            ;; "2" on the second question answers the second question.
+            (should (equal "SQLite" (map-nested-elt state '(:elicitations 24 :answers question_1))))
+            (should-not (map-nested-elt state '(:elicitations 24 :answers question_0)))))))))
+
+(ert-deftest agent-shell--answer-elicitation-keeps-form-open-on-last-answer-test ()
+  "Test a two-question form does not submit when the last answer lands.
+
+Submitting there would make a misclick on the last question final."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (rendered 0)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 20 (agent-shell-tests--two-question-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation)
+                 (lambda (&rest _) (setq rendered (1+ rendered)))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--answer-elicitation
+           :state state :request-id 20 :client 'test-client
+           :field-name 'question_0 :value "JWT")
+          (agent-shell--answer-elicitation
+           :state state :request-id 20 :client 'test-client
+           :field-name 'question_1 :value "Postgres")
+          (should-not responses)
+          (should (equal 2 rendered))
+          (should (map-elt (map-elt state :elicitations) 20)))))))
+
+(ert-deftest agent-shell--answer-elicitation-replaces-answer-test ()
+  "Test choosing another option for an answered question replaces it."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 21 (agent-shell-tests--two-question-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--answer-elicitation
+           :state state :request-id 21 :client 'test-client
+           :field-name 'question_0 :value "JWT")
+          (agent-shell--answer-elicitation
+           :state state :request-id 21 :client 'test-client
+           :field-name 'question_0 :value "Session")
+          (should-not responses)
+          (should (equal "Session"
+                         (map-nested-elt state '(:elicitations 21 :answers question_0)))))))))
+
+(ert-deftest agent-shell--submit-elicitation-sends-every-answer-test ()
+  "Test Submit sends one accept carrying every recorded answer."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 22 (agent-shell-tests--two-question-elicitation
+                            (list (cons 'question_0 "JWT")
+                                  (cons 'question_1 "SQLite"))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--submit-elicitation
+           :state state :request-id 22 :client 'test-client)
+          (should (equal 1 (length responses)))
+          (should (equal "accept" (map-nested-elt (car responses) '(:result action))))
+          (should (equal "JWT" (map-nested-elt (car responses) '(:result content question_0))))
+          (should (equal "SQLite" (map-nested-elt (car responses) '(:result content question_1))))
+          (should-not (map-elt state :elicitations)))))))
+
+(ert-deftest agent-shell--submit-elicitation-omits-unanswered-test ()
+  "Test Submit sends only the filled answers.
+
+The schema carries no required list, so a partial accept is legal and an
+unanswered question is simply absent."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 23 (agent-shell-tests--two-question-elicitation
+                            (list (cons 'question_0 "JWT"))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--submit-elicitation
+           :state state :request-id 23 :client 'test-client)
+          (should (equal "accept" (map-nested-elt (car responses) '(:result action))))
+          (should (equal "JWT" (map-nested-elt (car responses) '(:result content question_0))))
+          (should-not (map-contains-key (map-nested-elt (car responses) '(:result content))
+                                        'question_1)))))))
 
 (ert-deftest agent-shell-restart-preserves-default-directory ()
   "Restart should use the shell's directory, not the fallback buffer's.
