@@ -8986,7 +8986,7 @@ ACTIONS as per `agent-shell--make-permission-action'."
                       (map-insert (map-elt tool-calls tool-call-id)
                                   :diff-buffer diff-buffer))))))))
 
-(cl-defun agent-shell--make-permission-button (&key text help action keymap navigatable char option)
+(cl-defun agent-shell--make-permission-button (&key text help action keymap navigatable char option focus)
   "Create a permission button with TEXT, HELP, ACTION, and KEYMAP.
 
 For example:
@@ -8994,7 +8994,10 @@ For example:
   \"[ Allow (y) ]\"
 
 When NAVIGATABLE is non-nil, make button character navigatable.
-CHAR and OPTION are used for cursor sensor messages."
+CHAR and OPTION are used for cursor sensor messages.
+
+When FOCUS is non-nil, mark the navigatable character as the one point
+moves to.  See `agent-shell--jump-to-focus-button'."
   (let ((button (agent-shell--make-button
                  :text text
                  :help help
@@ -9015,6 +9018,10 @@ CHAR and OPTION are used for cursor sensor messages."
         (put-text-property (- (length button) (+ trailing 1))
                            (- (length button) trailing)
                            'agent-shell-permission-button t button)
+        (when focus
+          (put-text-property (- (length button) (+ trailing 1))
+                             (- (length button) trailing)
+                             'agent-shell-button-focus t button))
         (put-text-property (- (length button) (+ trailing 1))
                            (- (length button) trailing)
                            'cursor-sensor-functions
@@ -9158,6 +9165,31 @@ Returns non-nil if a permission button was found, nil otherwise."
     (deactivate-mark)
     (goto-char found)
     found))
+
+(defun agent-shell--jump-to-focus-button ()
+  "Jump to the latest button carrying `agent-shell-button-focus'.
+
+Moves point to that button and syncs the position into every window
+showing the buffer, across frames, the way
+`agent-shell-jump-to-latest-permission-button-row' does.
+
+Falls back to `agent-shell-jump-to-latest-permission-button-row' when no
+button carries the property, so a caller that sets no focus still lands on
+a button.
+
+Returns non-nil if a button was found, nil otherwise."
+  (if-let* ((target (save-mark-and-excursion
+                      (goto-char (point-max))
+                      (when-let* ((match (text-property-search-backward
+                                          'agent-shell-button-focus t t)))
+                        (prop-match-beginning match)))))
+      (progn
+        (deactivate-mark)
+        (goto-char target)
+        (dolist (window (get-buffer-window-list (current-buffer) nil t))
+          (set-window-point window target))
+        t)
+    (agent-shell-jump-to-latest-permission-button-row)))
 
 ;;; Elicitations
 
@@ -9362,6 +9394,7 @@ For example:
                                      :keymap keymap
                                      :navigatable t
                                      :char hotkey
+                                     :focus (= index 0)
                                      :option (format "answer %s" (map-elt option :title)))))
                                 (map-elt field :options))
                                " ")))
@@ -9416,12 +9449,12 @@ the same block id, so a recorded answer replaces the form in place."
      :navigation 'never
      :above-last-prompt (not (agent-shell--active-requests-p state)))
     (with-current-buffer (map-elt state :buffer)
-      (agent-shell-jump-to-latest-permission-button-row))
+      (agent-shell--jump-to-focus-button))
     (when-let* ((viewport-buffer (agent-shell-viewport--buffer
                                  :shell-buffer (map-elt state :buffer)
                                  :existing-only t)))
       (with-current-buffer viewport-buffer
-        (agent-shell-jump-to-latest-permission-button-row)))))
+        (agent-shell--jump-to-focus-button)))))
 
 (cl-defun agent-shell--answer-elicitation (&key state request-id client field-name value)
   "Record VALUE as the answer to FIELD-NAME in elicitation REQUEST-ID.

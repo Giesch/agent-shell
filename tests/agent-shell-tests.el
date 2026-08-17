@@ -4206,8 +4206,38 @@ first."
              ((symbol-function 'agent-shell--start-idle-timer) (lambda (&rest _)))
              ((symbol-function 'agent-shell-jump-to-latest-permission-button-row)
               (lambda (&rest _) t))
+             ((symbol-function 'agent-shell--jump-to-focus-button)
+              (lambda (&rest _) t))
              ((symbol-function 'agent-shell-viewport--buffer) (lambda (&rest _) nil)))
      ,@body))
+
+(defun agent-shell-tests--elicitation-text (elicitation)
+  "Return the rendered form text for ELICITATION.
+
+Renders through `agent-shell--make-elicitation-text', which needs no
+buffer and no stubs: it reads STATE only for the interrupt command's
+target buffer."
+  (agent-shell--make-elicitation-text
+   :elicitation elicitation
+   :request-id 1
+   :client 'test-client
+   :state (agent-shell-tests--elicitation-state (current-buffer))))
+
+(defun agent-shell-tests--focus-button-text (text)
+  "Return the text of the button in TEXT marked for focus, or nil.
+
+Bounds the button with the `button' property, which
+`agent-shell--make-button' puts on the whole button and on nothing
+between buttons."
+  (when-let* ((pos (agent-shell-tests--focus-button-position text)))
+    (let ((start (or (previous-single-property-change pos 'button text) 0))
+          (end (or (next-single-property-change pos 'button text) (length text))))
+      (substring-no-properties text start end))))
+
+(defun agent-shell-tests--focus-button-position (text &optional start)
+  "Return the position in TEXT marked for focus, searching from START."
+  (text-property-any (or start 0) (length text)
+                     'agent-shell-button-focus t text))
 
 (ert-deftest agent-shell--on-request-declines-non-form-elicitation-test ()
   "Test a non-form elicitation mode is declined rather than left hanging."
@@ -4468,6 +4498,52 @@ to a cancelled request and then fails the tool call."
         (should (agent-shell--elicitation-pending-p))
         (should (agent-shell--elicitation-pending-p :request-id 17))
         (should-not (agent-shell--elicitation-pending-p :request-id 99))))))
+
+(ert-deftest agent-shell--make-elicitation-text-focuses-first-option-test ()
+  "Test the form marks the first option of the first question for focus.
+
+`agent-shell--jump-to-focus-button' moves point to that character.  With
+no mark it falls back to the last button row, which is Skip, and a blind
+`RET' would decline the form."
+  (with-temp-buffer
+    (let* ((elicitation
+            (list (cons :message "Which auth approach?")
+                  (cons :fields
+                        (list (list (cons :name 'question_0)
+                                    (cons :options
+                                          (list (list (cons :value "JWT")
+                                                      (cons :title "JWT"))
+                                                (list (cons :value "Session")
+                                                      (cons :title "Session")))))))
+                  (cons :answers nil)))
+           (text (agent-shell-tests--elicitation-text elicitation))
+           (pos (agent-shell-tests--focus-button-position text)))
+      (should pos)
+      ;; The focused character is the one the navigation commands stop on.
+      (should (get-text-property pos 'agent-shell-permission-button text))
+      (should (equal "[ JWT (1) ]" (agent-shell-tests--focus-button-text text)))
+      ;; Exactly one character is marked, so Skip cannot be carrying it.
+      (should-not (agent-shell-tests--focus-button-position text (1+ pos))))))
+
+(ert-deftest agent-shell--make-elicitation-text-focuses-pending-question-test ()
+  "Test the form marks the first unanswered question for focus."
+  (with-temp-buffer
+    (let* ((elicitation
+            (list (cons :message "Answer these")
+                  (cons :fields
+                        (list (list (cons :name 'question_0)
+                                    (cons :options
+                                          (list (list (cons :value "JWT")
+                                                      (cons :title "JWT")))))
+                              (list (cons :name 'question_1)
+                                    (cons :options
+                                          (list (list (cons :value "Postgres")
+                                                      (cons :title "Postgres"))
+                                                (list (cons :value "SQLite")
+                                                      (cons :title "SQLite")))))))
+                  (cons :answers (list (cons 'question_0 "JWT")))))
+           (text (agent-shell-tests--elicitation-text elicitation)))
+      (should (equal "[ Postgres (1) ]" (agent-shell-tests--focus-button-text text))))))
 
 (ert-deftest agent-shell-restart-preserves-default-directory ()
   "Restart should use the shell's directory, not the fallback buffer's.
