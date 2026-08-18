@@ -4256,6 +4256,18 @@ target buffer."
    :client 'test-client
    :state (agent-shell-tests--elicitation-state (current-buffer))))
 
+(defun agent-shell-tests--elicitation-option-command (text option key)
+  "Return the command KEY runs on the button offering OPTION within TEXT.
+
+OPTION is matched against an unchosen option's label, so OPTION must be
+unanswered.  The command is read off the button's `keymap' text
+property, the way point reads it."
+  (when-let* ((position (string-search
+                         (format "[ %s %s"
+                                 agent-shell-markdown-list-checkbox-unchecked option)
+                         (substring-no-properties text))))
+    (lookup-key (get-text-property position 'keymap text) (kbd key))))
+
 (defun agent-shell-tests--focus-button-text (text)
   "Return the text of the button in TEXT marked for focus, or nil.
 
@@ -4424,7 +4436,7 @@ applies no timeout, so an unanswered request would block its tool call."
           (should (equal 1 (length (map-elt data :fields)))))))))
 
 (ert-deftest agent-shell--answer-elicitation-accepts-with-option-label-test ()
-  "Test answering the last question sends the option label as content.
+  "Test a submitting answer sends the option label as content.
 
 The agent validates accepted content and falls back to empty answers on a
 mismatch, so the content values must be plain strings."
@@ -4445,7 +4457,8 @@ mismatch, so the content values must be plain strings."
            :request-id 13
            :client 'test-client
            :field-name 'question_0
-           :value "JWT")
+           :value "JWT"
+           :submit t)
           (should (equal 1 (length responses)))
           (should (equal "accept" (map-nested-elt (car responses) '(:result action))))
           (should (equal "JWT" (map-nested-elt (car responses) '(:result content question_0))))
@@ -4593,21 +4606,21 @@ Answering out of order walks point back to the earliest gap."
                                  (substring text (string-search "Postgres" text)))))))
 
 (ert-deftest agent-shell--make-elicitation-text-renders-submit-test ()
-  "Test only a form of two or more questions renders Submit.
+  "Test every form renders Submit.
 
-A one-question form sends on the choice itself, so a Submit button there
-would have nothing to do."
+A one-question form is editable like any other, so its answer needs an
+explicit send."
   (with-temp-buffer
     (should (string-search
              "[ Submit (c) ]"
              (substring-no-properties
               (agent-shell-tests--elicitation-text
                (agent-shell-tests--two-question-elicitation)))))
-    (should-not (string-search
-                 "Submit"
-                 (substring-no-properties
-                  (agent-shell-tests--elicitation-text
-                   (agent-shell-tests--one-question-elicitation)))))))
+    (should (string-search
+             "[ Submit (c) ]"
+             (substring-no-properties
+              (agent-shell-tests--elicitation-text
+               (agent-shell-tests--one-question-elicitation)))))))
 
 (ert-deftest agent-shell--make-elicitation-text-scopes-digits-per-question-test ()
   "Test a question's digit hotkeys answer that question.
@@ -4727,6 +4740,122 @@ unanswered question is simply absent."
           (should (equal "JWT" (map-nested-elt (car responses) '(:result content question_0))))
           (should-not (map-contains-key (map-nested-elt (car responses) '(:result content))
                                         'question_1)))))))
+
+(ert-deftest agent-shell--elicitation-answer-completes-p-test ()
+  "Test the predicate reports the last unanswered question."
+  (let* ((two (agent-shell-tests--two-question-elicitation
+               (list (cons 'question_0 "JWT"))))
+         (fields (map-elt two :fields))
+         (one (agent-shell-tests--one-question-elicitation)))
+    (should (agent-shell--elicitation-answer-completes-p two (nth 1 fields)))
+    ;; Re-answering the first question leaves the second blank.
+    (should-not (agent-shell--elicitation-answer-completes-p two (nth 0 fields)))
+    (should (agent-shell--elicitation-answer-completes-p
+             one (car (map-elt one :fields))))))
+
+(ert-deftest agent-shell--answer-elicitation-keeps-one-question-form-open-test ()
+  "Test a one-question answer holds the form open for an edit."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (rendered 0)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 25 (agent-shell-tests--one-question-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation)
+                 (lambda (&rest _) (setq rendered (1+ rendered)))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--answer-elicitation
+           :state state :request-id 25 :client 'test-client
+           :field-name 'question_0 :value "JWT")
+          (should-not responses)
+          (should (equal 1 rendered))
+          (should (equal "JWT"
+                         (map-nested-elt state '(:elicitations 25 :answers question_0)))))))))
+
+(ert-deftest agent-shell--make-elicitation-text-submits-one-question-on-control-return-test ()
+  "Test `C-<return>' answers a one-question form and sends it.
+
+The common path costs one keystroke."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 26 (agent-shell-tests--one-question-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (let ((command (agent-shell-tests--elicitation-option-command
+                          (agent-shell--make-elicitation-text
+                           :elicitation (map-elt (map-elt state :elicitations) 26)
+                           :request-id 26
+                           :client 'test-client
+                           :state state)
+                          "Session" "C-<return>")))
+            (should (commandp command))
+            (funcall command))
+          (should (equal 1 (length responses)))
+          (should (equal "accept" (map-nested-elt (car responses) '(:result action))))
+          (should (equal "Session"
+                         (map-nested-elt (car responses) '(:result content question_0))))
+          (should-not (map-elt state :elicitations)))))))
+
+(ert-deftest agent-shell--make-elicitation-text-submits-last-question-on-control-return-test ()
+  "Test `C-<return>' answers the last blank question and sends the form."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 27 (agent-shell-tests--two-question-elicitation
+                            (list (cons 'question_0 "JWT"))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (let ((command (agent-shell-tests--elicitation-option-command
+                          (agent-shell--make-elicitation-text
+                           :elicitation (map-elt (map-elt state :elicitations) 27)
+                           :request-id 27
+                           :client 'test-client
+                           :state state)
+                          "SQLite" "C-<return>")))
+            (should (commandp command))
+            (funcall command))
+          (should (equal 1 (length responses)))
+          (should (equal "JWT"
+                         (map-nested-elt (car responses) '(:result content question_0))))
+          (should (equal "SQLite"
+                         (map-nested-elt (car responses) '(:result content question_1))))
+          (should-not (map-elt state :elicitations)))))))
+
+(ert-deftest agent-shell--make-elicitation-text-defers-control-return-on-open-question-test ()
+  "Test `C-<return>' records alone while another question is blank.
+
+The chord must not send a partial accept by accident."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 28 (agent-shell-tests--two-question-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (let ((command (agent-shell-tests--elicitation-option-command
+                          (agent-shell--make-elicitation-text
+                           :elicitation (map-elt (map-elt state :elicitations) 28)
+                           :request-id 28
+                           :client 'test-client
+                           :state state)
+                          "JWT" "C-<return>")))
+            (should (commandp command))
+            (funcall command))
+          (should-not responses)
+          (should (equal "JWT"
+                         (map-nested-elt state '(:elicitations 28 :answers question_0))))
+          (should (map-elt (map-elt state :elicitations) 28)))))))
 
 (ert-deftest agent-shell-restart-preserves-default-directory ()
   "Restart should use the shell's directory, not the fallback buffer's.

@@ -9273,9 +9273,16 @@ companion to a question, and no schema listing one marks it required."
                 (not (map-contains-key answers (map-elt field :name))))
               (map-elt elicitation :fields))))
 
-(defun agent-shell--elicitation-complete-p (elicitation)
-  "Return non-nil when every field in ELICITATION has an answer."
-  (not (agent-shell--elicitation-pending-field elicitation)))
+(defun agent-shell--elicitation-answer-completes-p (elicitation field)
+  "Return non-nil when answering FIELD completes ELICITATION.
+
+Every other field of ELICITATION already carries an answer.  A
+one-question form always satisfies this."
+  (let ((answers (map-elt elicitation :answers)))
+    (seq-every-p (lambda (other)
+                   (or (eq other field)
+                       (map-contains-key answers (map-elt other :name))))
+                 (map-elt elicitation :fields))))
 
 (defun agent-shell--elicitation-field-label (field fallback)
   "Return the question text for FIELD, or FALLBACK when it carries none.
@@ -9289,10 +9296,11 @@ label for the answer (\"Auth\"), not the question, so it comes last."
       (map-elt field :title)
       (format "%s" (map-elt field :name))))
 
-(cl-defun agent-shell--make-elicitation-answer-command (&key state request-id client field-name value)
+(cl-defun agent-shell--make-elicitation-answer-command (&key state request-id client field-name value submit)
   "Return a command recording VALUE as the answer to FIELD-NAME.
 
-STATE, REQUEST-ID, and CLIENT identify the elicitation to update."
+STATE, REQUEST-ID, and CLIENT identify the elicitation to update.
+When SUBMIT is non-nil, the command also sends the form."
   (lambda ()
     (interactive)
     (agent-shell--answer-elicitation
@@ -9300,7 +9308,8 @@ STATE, REQUEST-ID, and CLIENT identify the elicitation to update."
      :request-id request-id
      :client client
      :field-name field-name
-     :value value)))
+     :value value
+     :submit submit)))
 
 (cl-defun agent-shell--make-elicitation-text (&key elicitation request-id client state)
   "Create text to render the question form for ELICITATION.
@@ -9310,9 +9319,14 @@ client used to send the response.
 
 Every question renders its options as buttons, numbered for hotkey
 access.  The chosen option of a question is marked, and choosing another
-option replaces it.  A form of two or more questions carries a Submit
-button and sends the answers when it is pressed.  A one-question form
-carries no Submit and sends on the choice itself.
+option replaces it.  The form carries a Submit button and sends the
+answers when it is pressed.
+
+`C-<return>' on an option records that answer and submits the form.  It
+submits only when every other question already carries an answer.
+Elsewhere it records the answer alone, so the chord never sends a
+partial accept.  A terminal sends the same byte for `RET' and
+`C-<return>', so the chord records the answer alone there too.
 
 Point lands on the first option of the first unanswered question, or on
 Submit once every question is answered.  See
@@ -9367,11 +9381,7 @@ For example:
          ;; button as a text property, so point picks the question.
          (keymap (let ((map (make-sparse-keymap)))
                    (define-key map (kbd "s") skip-action)
-                   ;; A one-question form renders no Submit button, and an
-                   ;; unscoped "c" there would accept from an
-                   ;; unadvertised key.
-                   (unless single
-                     (define-key map (kbd "c") submit-action))
+                   (define-key map (kbd "c") submit-action)
                    ;; Add interrupt keybinding
                    (define-key map (kbd "C-c C-c")
                                (lambda ()
@@ -9385,6 +9395,8 @@ For example:
                                             field (when single message))
                                            'font-lock-face 'agent-shell-input))
                         (answer (map-elt answers (map-elt field :name)))
+                        (completes (agent-shell--elicitation-answer-completes-p
+                                    elicitation field))
                         (field-keymap (make-sparse-keymap)))
                     (set-keymap-parent field-keymap keymap)
                     (seq-do-indexed
@@ -9402,16 +9414,29 @@ For example:
                             (string-join
                              (seq-map-indexed
                               (lambda (option index)
-                                (let ((hotkey (when (< index 9)
-                                                (number-to-string (1+ index))))
-                                      ;; A glyph rather than a face: the
-                                      ;; button frame is a box in a
-                                      ;; graphical frame and brackets in a
-                                      ;; terminal, so a background colour
-                                      ;; would not read the same in both.
-                                      (glyph (if (equal answer (map-elt option :value))
-                                                 agent-shell-markdown-list-checkbox-checked
-                                               agent-shell-markdown-list-checkbox-unchecked)))
+                                (let* ((hotkey (when (< index 9)
+                                                 (number-to-string (1+ index))))
+                                       ;; A glyph rather than a face: the
+                                       ;; button frame is a box in a
+                                       ;; graphical frame and brackets in a
+                                       ;; terminal, so a background colour
+                                       ;; would not read the same in both.
+                                       (glyph (if (equal answer (map-elt option :value))
+                                                  agent-shell-markdown-list-checkbox-checked
+                                                agent-shell-markdown-list-checkbox-unchecked))
+                                       ;; "C-<return>" acts on the option
+                                       ;; point sits on, so it binds below
+                                       ;; the question's digits.
+                                       (option-keymap (make-sparse-keymap)))
+                                  (set-keymap-parent option-keymap field-keymap)
+                                  (define-key option-keymap (kbd "C-<return>")
+                                              (agent-shell--make-elicitation-answer-command
+                                               :state state
+                                               :request-id request-id
+                                               :client client
+                                               :field-name (map-elt field :name)
+                                               :value (map-elt option :value)
+                                               :submit completes))
                                   (agent-shell--make-permission-button
                                    ;; The hotkey stays last:
                                    ;; `agent-shell--make-permission-button'
@@ -9428,11 +9453,14 @@ For example:
                                             :client client
                                             :field-name (map-elt field :name)
                                             :value (map-elt option :value))
-                                   :keymap field-keymap
+                                   :keymap option-keymap
                                    :navigatable t
                                    :char hotkey
                                    :focus (and (eq field pending) (= index 0))
-                                   :option (format "answer %s" (map-elt option :title)))))
+                                   :option (if completes
+                                               (format "answer %s, or C-RET to answer and submit"
+                                                       (map-elt option :title))
+                                             (format "answer %s" (map-elt option :title))))))
                               (map-elt field :options))
                              " "))))
                 fields)))
@@ -9457,25 +9485,23 @@ For example:
             (string-join
              (append rows
                      (list (string-join
-                            (append
-                             (unless single
-                               (list (agent-shell--make-permission-button
-                                      :text "Submit (c)"
-                                      :help "Press c to submit"
-                                      :action submit-action
-                                      :keymap keymap
-                                      :navigatable t
-                                      :char "c"
-                                      :focus (null pending)
-                                      :option "submit")))
-                             (list (agent-shell--make-permission-button
-                                    :text "Skip (s)"
-                                    :help "Press s to skip"
-                                    :action skip-action
-                                    :keymap keymap
-                                    :navigatable t
-                                    :char "s"
-                                    :option "skip")))
+                            (list (agent-shell--make-permission-button
+                                   :text "Submit (c)"
+                                   :help "Press c to submit"
+                                   :action submit-action
+                                   :keymap keymap
+                                   :navigatable t
+                                   :char "c"
+                                   :focus (null pending)
+                                   :option "submit")
+                                  (agent-shell--make-permission-button
+                                   :text "Skip (s)"
+                                   :help "Press s to skip"
+                                   :action skip-action
+                                   :keymap keymap
+                                   :navigatable t
+                                   :char "s"
+                                   :option "skip"))
                             " ")))
              "\n\n    "))))
 
@@ -9505,12 +9531,11 @@ the same block id, so a recorded answer replaces the form in place."
       (with-current-buffer viewport-buffer
         (agent-shell--jump-to-focus-button)))))
 
-(cl-defun agent-shell--answer-elicitation (&key state request-id client field-name value)
+(cl-defun agent-shell--answer-elicitation (&key state request-id client field-name value submit)
   "Record VALUE as the answer to FIELD-NAME in elicitation REQUEST-ID.
 
 Re-renders the form, so the answer can be replaced until it is submitted.
-A one-question form sends the answer instead: its single choice is the
-submit, and it renders no Submit button.
+When SUBMIT is non-nil, sends the form instead of re-rendering it.
 
 STATE is the buffer-local session state and CLIENT is the ACP client used
 to send the response."
@@ -9520,8 +9545,7 @@ to send the response."
                                      (map-insert (map-elt elicitation :answers)
                                                  field-name value))))
       (agent-shell--save-elicitation state request-id updated)
-      (if (and (= (length (map-elt updated :fields)) 1)
-               (agent-shell--elicitation-complete-p updated))
+      (if submit
           (agent-shell--submit-elicitation
            :state state
            :request-id request-id
