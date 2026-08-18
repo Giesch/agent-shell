@@ -122,6 +122,34 @@ You may use \"􀇾\" as an SF Symbol on macOS."
   :type 'string
   :group 'agent-shell)
 
+(defcustom agent-shell-elicitation-selected-icon "●"
+  "Icon marking the chosen option of a single-select question.
+
+A single-select question accepts one answer, so its options render as
+radio buttons.  See `agent-shell-elicitation-checked-icon' for the
+multi-select glyph."
+  :type 'string
+  :group 'agent-shell)
+
+(defcustom agent-shell-elicitation-unselected-icon "○"
+  "Icon marking an option of a single-select question that is not chosen."
+  :type 'string
+  :group 'agent-shell)
+
+(defcustom agent-shell-elicitation-checked-icon "✓"
+  "Icon marking a selected option of a multi-select question.
+
+A multi-select question accepts several answers, so its options render as
+checkboxes.  See `agent-shell-elicitation-selected-icon' for the
+single-select glyph."
+  :type 'string
+  :group 'agent-shell)
+
+(defcustom agent-shell-elicitation-unchecked-icon "□"
+  "Icon marking an option of a multi-select question that is not selected."
+  :type 'string
+  :group 'agent-shell)
+
 (defcustom agent-shell-thought-process-icon "✶"
   "Icon displayed during the AI's thought process.
 
@@ -9215,25 +9243,44 @@ non-string makes the form unrenderable."
             (cons :title (if (stringp title) title value))
             (cons :description (when (stringp description) description))))))
 
-(defun agent-shell--elicitation-field (name spec)
-  "Make a single-select field named NAME from schema SPEC.
+(defun agent-shell--elicitation-options (acp-options)
+  "Make options from ACP-OPTIONS for form rendering.
 
-Returns an alist with keys :name, :title, :description, and :options, or
-nil when SPEC is not a single-select string field whose options this shell
-can render."
-  (when-let* (((equal (map-elt spec 'type) "string"))
-              (acp-options (map-elt spec 'oneOf))
-              ((vectorp acp-options))
+ACP-OPTIONS is the enum option vector of a `requestedSchema' field.
+Returns a list of options in schema order, or nil when the vector is
+empty or carries an option this shell cannot render.  See
+`agent-shell--elicitation-option'."
+  (when-let* (((vectorp acp-options))
               ((> (length acp-options) 0))
               (options (mapcar #'agent-shell--elicitation-option
                                (append acp-options nil)))
               ((not (memq nil options))))
-    (let ((title (map-elt spec 'title))
-          (description (map-elt spec 'description)))
-      (list (cons :name name)
-            (cons :title (when (stringp title) title))
-            (cons :description (when (stringp description) description))
-            (cons :options options)))))
+    options))
+
+(defun agent-shell--elicitation-field (name spec)
+  "Make a field named NAME from schema SPEC.
+
+Returns an alist with keys :name, :title, :description, :multi, and
+:options, or nil when SPEC is neither a single-select nor a multi-select
+field whose options this shell can render.
+
+A single-select field is a string with a `oneOf' enum and answers with one
+option label.  A multi-select field is an array whose `items' carry an
+`anyOf' enum, and answers with a vector of option labels.  :multi is
+non-nil for the second."
+  (let* ((type (map-elt spec 'type))
+         (multi (equal type "array"))
+         (options (agent-shell--elicitation-options
+                   (cond (multi (map-nested-elt spec '(items anyOf)))
+                         ((equal type "string") (map-elt spec 'oneOf))))))
+    (when options
+      (let ((title (map-elt spec 'title))
+            (description (map-elt spec 'description)))
+        (list (cons :name name)
+              (cons :title (when (stringp title) title))
+              (cons :description (when (stringp description) description))
+              (cons :multi multi)
+              (cons :options options))))))
 
 (defun agent-shell--elicitation-form-fields (requested-schema)
   "Return the renderable fields of REQUESTED-SCHEMA, or `unsupported'.
@@ -9243,8 +9290,8 @@ REQUESTED-SCHEMA is the `requestedSchema' object of an
 order.  See `agent-shell--elicitation-field'.
 
 Returns the symbol `unsupported' when the schema asks for anything this
-shell cannot render: a `required' list, a multi-select field, or a field
-that is not a single-select string.  An unrenderable form is declined,
+shell cannot render: a `required' list, or a field that is neither a
+single-select nor a multi-select.  An unrenderable form is declined,
 which is what the agent falls back to on its own.  Sending a partial
 answer instead would put words in the user's mouth.
 
@@ -9296,6 +9343,25 @@ label for the answer (\"Auth\"), not the question, so it comes last."
       (map-elt field :title)
       (format "%s" (map-elt field :name))))
 
+(defun agent-shell--elicitation-toggle-selection (field selection value)
+  "Add VALUE to SELECTION, or remove it when SELECTION already carries it.
+
+FIELD is a multi-select field and SELECTION is its current answer: a
+vector of option labels, or nil when the question is unanswered.
+
+Returns a vector in FIELD's option order rather than in the order the
+options were pressed, so the answer reads the way the question does.
+Returns nil when the toggle leaves nothing selected, which
+`agent-shell--answer-elicitation' records as unanswered."
+  (let* ((chosen (if (seq-contains-p selection value)
+                     (seq-remove (lambda (each) (equal each value)) selection)
+                   (append selection (list value))))
+         (ordered (seq-filter (lambda (option)
+                                (seq-contains-p chosen (map-elt option :value)))
+                              (map-elt field :options))))
+    (when ordered
+      (vconcat (mapcar (lambda (option) (map-elt option :value)) ordered)))))
+
 (cl-defun agent-shell--make-elicitation-answer-command (&key state request-id client field-name value submit)
   "Return a command recording VALUE as the answer to FIELD-NAME.
 
@@ -9311,6 +9377,30 @@ When SUBMIT is non-nil, the command also sends the form."
      :value value
      :submit submit)))
 
+(cl-defun agent-shell--make-elicitation-toggle-command (&key state request-id client field value submit)
+  "Return a command adding VALUE to FIELD's answer, or removing it.
+
+FIELD is a multi-select field of the elicitation REQUEST-ID identifies
+within STATE.  CLIENT is the ACP client used to send the response.
+When SUBMIT is non-nil, the command also sends the form.
+
+The selection is read from STATE when the command runs, not when the form
+is rendered, so a stale button cannot resurrect an old selection."
+  (lambda ()
+    (interactive)
+    (let ((field-name (map-elt field :name)))
+      (agent-shell--answer-elicitation
+       :state state
+       :request-id request-id
+       :client client
+       :field-name field-name
+       :value (agent-shell--elicitation-toggle-selection
+               field
+               (map-nested-elt state (list :elicitations request-id :answers field-name))
+               value)
+       :focus-option (cons field-name value)
+       :submit submit))))
+
 (cl-defun agent-shell--make-elicitation-text (&key elicitation request-id client state)
   "Create text to render the question form for ELICITATION.
 
@@ -9318,18 +9408,20 @@ REQUEST-ID identifies the elicitation within STATE.  CLIENT is the ACP
 client used to send the response.
 
 Every question renders its options as buttons, numbered for hotkey
-access.  The chosen option of a question is marked, and choosing another
-option replaces it.  The form carries a Submit button and sends the
-answers when it is pressed.
+access.  A single-select question renders radios and a press replaces its
+answer.  A multi-select question renders checkboxes and a press toggles
+one option.  The form carries a Submit button and sends the answers when
+it is pressed.
 
 `C-<return>' on an option records that answer and submits the form.  It
-submits only when every other question already carries an answer.
+submits only when every other question already carries an answer, and a
+multi-select toggle that clears the last selected option never submits.
 Elsewhere it records the answer alone, so the chord never sends a
 partial accept.  A terminal sends the same byte for `RET' and
 `C-<return>', so the chord records the answer alone there too.
 
-Point lands on the first option of the first unanswered question, or on
-Submit once every question is answered.  See
+Point lands on the option a multi-select toggle just acted on, else on
+the first option of the first unanswered question, else on Submit.  See
 `agent-shell--jump-to-focus-button'.
 
 For example:
@@ -9344,11 +9436,11 @@ For example:
 
        Which auth approach?
 
-       [ ✓ JWT (1) ] [ □ Session (2) ]
+       [ ● JWT (1) ] [ ○ Session (2) ]
 
-       Which database?
+       Which areas should the tests cover?
 
-       [ □ Postgres (1) ] [ □ SQLite (2) ]
+       [ ✓ Parsing (1) ] [ □ Rendering (2) ] [ ✓ Errors (3) ]
 
        [ Submit (c) ] [ Skip (s) ]
 
@@ -9358,6 +9450,10 @@ For example:
          (fields (map-elt elicitation :fields))
          (answers (map-elt elicitation :answers))
          (pending (agent-shell--elicitation-pending-field elicitation))
+         ;; The option a multi-select toggle just acted on.  Point stays
+         ;; there rather than moving to the next question, so the question's
+         ;; own digit hotkeys stay under point for the next toggle.
+         (focus-option (map-elt elicitation :focus-option))
          ;; With one question the message is the question itself.  With
          ;; several it is a generic lead-in, rendered once as a header.
          (single (= (length fields) 1))
@@ -9391,24 +9487,39 @@ For example:
                    map))
          (rows (mapcar
                 (lambda (field)
-                  (let ((label (propertize (agent-shell--elicitation-field-label
-                                            field (when single message))
-                                           'font-lock-face 'agent-shell-input))
-                        (answer (map-elt answers (map-elt field :name)))
-                        (completes (agent-shell--elicitation-answer-completes-p
-                                    elicitation field))
-                        (field-keymap (make-sparse-keymap)))
+                  (let* ((multi (map-elt field :multi))
+                         (label (propertize (agent-shell--elicitation-field-label
+                                             field (when single message))
+                                            'font-lock-face 'agent-shell-input))
+                         (answer (map-elt answers (map-elt field :name)))
+                         (completes (agent-shell--elicitation-answer-completes-p
+                                     elicitation field))
+                         (field-keymap (make-sparse-keymap))
+                         ;; A single-select press replaces the answer.  A
+                         ;; multi-select press toggles one option of it.
+                         (option-command
+                          (lambda (option submit)
+                            (if multi
+                                (agent-shell--make-elicitation-toggle-command
+                                 :state state
+                                 :request-id request-id
+                                 :client client
+                                 :field field
+                                 :value (map-elt option :value)
+                                 :submit submit)
+                              (agent-shell--make-elicitation-answer-command
+                               :state state
+                               :request-id request-id
+                               :client client
+                               :field-name (map-elt field :name)
+                               :value (map-elt option :value)
+                               :submit submit)))))
                     (set-keymap-parent field-keymap keymap)
                     (seq-do-indexed
                      (lambda (option index)
                        (when (< index 9)
                          (define-key field-keymap (kbd (number-to-string (1+ index)))
-                                     (agent-shell--make-elicitation-answer-command
-                                      :state state
-                                      :request-id request-id
-                                      :client client
-                                      :field-name (map-elt field :name)
-                                      :value (map-elt option :value)))))
+                                     (funcall option-command option nil))))
                      (map-elt field :options))
                     (format "%s\n\n    %s" label
                             (string-join
@@ -9416,27 +9527,47 @@ For example:
                               (lambda (option index)
                                 (let* ((hotkey (when (< index 9)
                                                  (number-to-string (1+ index))))
+                                       (value (map-elt option :value))
+                                       (selected (if multi
+                                                     (seq-contains-p answer value)
+                                                   (equal answer value)))
                                        ;; A glyph rather than a face: the
                                        ;; button frame is a box in a
                                        ;; graphical frame and brackets in a
                                        ;; terminal, so a background colour
                                        ;; would not read the same in both.
-                                       (glyph (if (equal answer (map-elt option :value))
-                                                  agent-shell-markdown-list-checkbox-checked
-                                                agent-shell-markdown-list-checkbox-unchecked))
+                                       ;; A radio marks a question that takes
+                                       ;; one answer, a checkbox one that
+                                       ;; takes several.
+                                       (glyph (cond ((and multi selected)
+                                                     agent-shell-elicitation-checked-icon)
+                                                    (multi
+                                                     agent-shell-elicitation-unchecked-icon)
+                                                    (selected
+                                                     agent-shell-elicitation-selected-icon)
+                                                    (t
+                                                     agent-shell-elicitation-unselected-icon)))
+                                       (verb (cond ((not multi) "answer")
+                                                   (selected "unselect")
+                                                   (t "select")))
+                                       ;; A multi-select press that clears the
+                                       ;; last selected option leaves the
+                                       ;; question unanswered, so the chord
+                                       ;; toggles alone rather than submitting
+                                       ;; a form it just emptied.
+                                       (chord-submits
+                                        (and completes
+                                             (or (not multi)
+                                                 (and (agent-shell--elicitation-toggle-selection
+                                                       field answer value)
+                                                      t))))
                                        ;; "C-<return>" acts on the option
                                        ;; point sits on, so it binds below
                                        ;; the question's digits.
                                        (option-keymap (make-sparse-keymap)))
                                   (set-keymap-parent option-keymap field-keymap)
                                   (define-key option-keymap (kbd "C-<return>")
-                                              (agent-shell--make-elicitation-answer-command
-                                               :state state
-                                               :request-id request-id
-                                               :client client
-                                               :field-name (map-elt field :name)
-                                               :value (map-elt option :value)
-                                               :submit completes))
+                                              (funcall option-command option chord-submits))
                                   (agent-shell--make-permission-button
                                    ;; The hotkey stays last:
                                    ;; `agent-shell--make-permission-button'
@@ -9447,20 +9578,18 @@ For example:
                                            (format "%s %s" glyph (map-elt option :title)))
                                    :help (or (map-elt option :description)
                                              (map-elt option :title))
-                                   :action (agent-shell--make-elicitation-answer-command
-                                            :state state
-                                            :request-id request-id
-                                            :client client
-                                            :field-name (map-elt field :name)
-                                            :value (map-elt option :value))
+                                   :action (funcall option-command option nil)
                                    :keymap option-keymap
                                    :navigatable t
                                    :char hotkey
-                                   :focus (and (eq field pending) (= index 0))
-                                   :option (if completes
-                                               (format "answer %s, or C-RET to answer and submit"
-                                                       (map-elt option :title))
-                                             (format "answer %s" (map-elt option :title))))))
+                                   :focus (if focus-option
+                                              (and (equal (car focus-option) (map-elt field :name))
+                                                   (equal (cdr focus-option) value))
+                                            (and (eq field pending) (= index 0)))
+                                   :option (if chord-submits
+                                               (format "%s %s, or C-RET to %s and submit"
+                                                       verb (map-elt option :title) verb)
+                                             (format "%s %s" verb (map-elt option :title))))))
                               (map-elt field :options))
                              " "))))
                 fields)))
@@ -9492,7 +9621,7 @@ For example:
                                    :keymap keymap
                                    :navigatable t
                                    :char "c"
-                                   :focus (null pending)
+                                   :focus (and (null focus-option) (null pending))
                                    :option "submit")
                                   (agent-shell--make-permission-button
                                    :text "Skip (s)"
@@ -9531,19 +9660,34 @@ the same block id, so a recorded answer replaces the form in place."
       (with-current-buffer viewport-buffer
         (agent-shell--jump-to-focus-button)))))
 
-(cl-defun agent-shell--answer-elicitation (&key state request-id client field-name value submit)
+(cl-defun agent-shell--answer-elicitation (&key state request-id client field-name value submit focus-option)
   "Record VALUE as the answer to FIELD-NAME in elicitation REQUEST-ID.
 
 Re-renders the form, so the answer can be replaced until it is submitted.
 When SUBMIT is non-nil, sends the form instead of re-rendering it.
 
+A nil VALUE drops the answer, so the question is unanswered again.  A
+multi-select question whose last selected option is toggled off passes
+nil.  The form keys on the presence of an answer, and the agent drops an
+empty one, so the two would otherwise disagree.
+
+FOCUS-OPTION is a cons of a field name and an option value, marking the
+option point lands on after the re-render.  A nil FOCUS-OPTION returns
+point to the first option of the first unanswered question.
+
 STATE is the buffer-local session state and CLIENT is the ACP client used
 to send the response."
   (with-current-buffer (map-elt state :buffer)
     (when-let* ((elicitation (map-elt (map-elt state :elicitations) request-id))
-                (updated (map-insert elicitation :answers
-                                     (map-insert (map-elt elicitation :answers)
-                                                 field-name value))))
+                ;; `answers' is nil until the first answer lands, so it is
+                ;; read below rather than bound here: a nil binding would
+                ;; short-circuit `when-let*'.
+                (updated (let ((answers (map-elt elicitation :answers)))
+                           (map-insert (map-insert elicitation :focus-option focus-option)
+                                       :answers
+                                       (if value
+                                           (map-insert answers field-name value)
+                                         (map-delete (copy-alist answers) field-name))))))
       (agent-shell--save-elicitation state request-id updated)
       (if submit
           (agent-shell--submit-elicitation
@@ -9620,10 +9764,10 @@ STATE is the buffer-local session state."
 (cl-defun agent-shell--on-elicitation-create-request (&key state acp-request)
   "Handle an \"elicitation/create\" ACP-REQUEST using STATE.
 
-Renders a form of single-select questions, and declines any request this
-shell cannot render.  A url-mode request and an unsupported schema are
-both declined rather than failed: the agent treats a decline as the user
-skipping the questions and carries on.
+Renders a form of single-select and multi-select questions, and declines
+any request this shell cannot render.  A url-mode request and an
+unsupported schema are both declined rather than failed: the agent treats
+a decline as the user skipping the questions and carries on.
 
 Every path answers the request.  `acp.el' swallows an error raised here
 and the agent applies no timeout, so an unanswered request would block its

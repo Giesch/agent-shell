@@ -4055,6 +4055,7 @@ Gemini sends these fields as empty arrays."
            '(((:name . question_0)
               (:title . "Auth")
               (:description)
+              (:multi)
               (:options . (((:value . "JWT")
                             (:title . "JWT")
                             (:description . "Stateless"))
@@ -4122,14 +4123,72 @@ skipping it still produces a valid answer."
     (should (equal 1 (length fields)))
     (should (equal 'question_0 (map-elt (car fields) :name)))))
 
-(ert-deftest agent-shell--elicitation-form-fields-rejects-multi-select-test ()
-  "Test `agent-shell--elicitation-form-fields' declines a multi-select field."
+(ert-deftest agent-shell--elicitation-form-fields-multi-select-test ()
+  "Test `agent-shell--elicitation-form-fields' walks a multi-select question.
+
+A multi-select question is an array whose `items' carry an `anyOf' enum.
+The field is marked :multi, which the form renders as checkboxes."
+  (should (equal
+           '(((:name . question_0)
+              (:title . "Areas")
+              (:description . "Which areas?")
+              (:multi . t)
+              (:options . (((:value . "Parsing")
+                            (:title . "Parsing")
+                            (:description . "The reader"))
+                           ((:value . "Rendering")
+                            (:title . "Rendering")
+                            (:description))))))
+           (agent-shell--elicitation-form-fields
+            '((type . "object")
+              (properties . ((question_0 . ((type . "array")
+                                            (title . "Areas")
+                                            (description . "Which areas?")
+                                            (items . ((anyOf . [((const . "Parsing")
+                                                                 (title . "Parsing")
+                                                                 (description . "The reader"))
+                                                                ((const . "Rendering")
+                                                                 (title . "Rendering"))]))))))))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-rejects-array-without-options-test ()
+  "Test `agent-shell--elicitation-form-fields' declines a bare array field.
+
+An MCP form may ask for a free-form list.  It carries no enum, so there
+is nothing to render as buttons."
+  (should (equal
+           'unsupported
+           (agent-shell--elicitation-form-fields
+            '((type . "object")
+              (properties . ((question_0 . ((type . "array")))))))))
   (should (equal
            'unsupported
            (agent-shell--elicitation-form-fields
             '((type . "object")
               (properties . ((question_0 . ((type . "array")
-                                            (items . ((anyOf . [((const . "a") (title . "a"))]))))))))))))
+                                            (items . ((type . "string"))))))))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-rejects-empty-options-test ()
+  "Test `agent-shell--elicitation-form-fields' declines an empty enum.
+
+A question with no options cannot be answered."
+  (should (equal
+           'unsupported
+           (agent-shell--elicitation-form-fields
+            '((type . "object")
+              (properties . ((question_0 . ((type . "array")
+                                            (items . ((anyOf . []))))))))))))
+
+(ert-deftest agent-shell--elicitation-form-fields-rejects-non-string-multi-option-test ()
+  "Test `agent-shell--elicitation-form-fields' declines a non-string option.
+
+The multi-select path applies the same option check as the single-select
+one.  See `agent-shell--elicitation-form-fields-rejects-non-string-option-test'."
+  (should (equal
+           'unsupported
+           (agent-shell--elicitation-form-fields
+            '((type . "object")
+              (properties . ((question_0 . ((type . "array")
+                                            (items . ((anyOf . [((const . 1) (title . "one"))]))))))))))))
 
 (ert-deftest agent-shell--elicitation-form-fields-rejects-required-test ()
   "Test `agent-shell--elicitation-form-fields' declines a required list.
@@ -4256,15 +4315,19 @@ target buffer."
    :client 'test-client
    :state (agent-shell-tests--elicitation-state (current-buffer))))
 
-(defun agent-shell-tests--elicitation-option-command (text option key)
+(cl-defun agent-shell-tests--elicitation-option-command (text option key &key glyph)
   "Return the command KEY runs on the button offering OPTION within TEXT.
 
-OPTION is matched against an unchosen option's label, so OPTION must be
-unanswered.  The command is read off the button's `keymap' text
-property, the way point reads it."
+OPTION is matched against the label of a button carrying GLYPH, which
+defaults to `agent-shell-elicitation-unselected-icon'.  Pass the glyph
+that matches the question's kind and the option's state: a selected
+multi-select option carries `agent-shell-elicitation-checked-icon'.  The
+command is read off the button's `keymap' text property, the way point
+reads it."
   (when-let* ((position (string-search
                          (format "[ %s %s"
-                                 agent-shell-markdown-list-checkbox-unchecked option)
+                                 (or glyph agent-shell-elicitation-unselected-icon)
+                                 option)
                          (substring-no-properties text))))
     (lookup-key (get-text-property position 'keymap text) (kbd key))))
 
@@ -4319,7 +4382,7 @@ between buttons."
                                    (requestedSchema
                                     . ((type . "object")
                                        (properties . ((question_0 . ((type . "array")
-                                                                     (items . ((anyOf . [((const . "a") (title . "a"))])))))))))))))
+                                                                     (items . ((type . "string")))))))))))))
         (should (equal 1 (length responses)))
         (should (equal "decline" (map-nested-elt (car responses) '(:result action))))
         (should-not (map-elt state :elicitations))))))
@@ -4558,7 +4621,7 @@ no mark it falls back to the last button row, which is Skip, and a blind
       (should pos)
       ;; The focused character is the one the navigation commands stop on.
       (should (get-text-property pos 'agent-shell-permission-button text))
-      (should (equal (format "[ %s JWT (1) ]" agent-shell-markdown-list-checkbox-unchecked)
+      (should (equal (format "[ %s JWT (1) ]" agent-shell-elicitation-unselected-icon)
                      (agent-shell-tests--focus-button-text text)))
       ;; Exactly one character is marked, so Skip cannot be carrying it.
       (should-not (agent-shell-tests--focus-button-position text (1+ pos))))))
@@ -4571,12 +4634,12 @@ Answering out of order walks point back to the earliest gap."
     (let ((text (agent-shell-tests--elicitation-text
                  (agent-shell-tests--two-question-elicitation
                   (list (cons 'question_1 "SQLite"))))))
-      (should (equal (format "[ %s JWT (1) ]" agent-shell-markdown-list-checkbox-unchecked)
+      (should (equal (format "[ %s JWT (1) ]" agent-shell-elicitation-unselected-icon)
                      (agent-shell-tests--focus-button-text text))))
     (let ((text (agent-shell-tests--elicitation-text
                  (agent-shell-tests--two-question-elicitation
                   (list (cons 'question_0 "JWT"))))))
-      (should (equal (format "[ %s Postgres (1) ]" agent-shell-markdown-list-checkbox-unchecked)
+      (should (equal (format "[ %s Postgres (1) ]" agent-shell-elicitation-unselected-icon)
                      (agent-shell-tests--focus-button-text text))))))
 
 (ert-deftest agent-shell--make-elicitation-text-focuses-submit-when-answered-test ()
@@ -4595,8 +4658,8 @@ Answering out of order walks point back to the earliest gap."
                  (agent-shell-tests--elicitation-text
                   (agent-shell-tests--two-question-elicitation
                    (list (cons 'question_0 "Session"))))))
-          (checked agent-shell-markdown-list-checkbox-checked)
-          (unchecked agent-shell-markdown-list-checkbox-unchecked))
+          (checked agent-shell-elicitation-selected-icon)
+          (unchecked agent-shell-elicitation-unselected-icon))
       (should (string-search (format "[ %s Session (2) ]" checked) text))
       (should (string-search (format "[ %s JWT (1) ]" unchecked) text))
       ;; The unanswered question marks nothing.
@@ -4644,7 +4707,7 @@ digits, and the map rides on the button, so point picks the question."
                         :state state))
                  (position (string-search
                             (format "[ %s SQLite"
-                                    agent-shell-markdown-list-checkbox-unchecked)
+                                    agent-shell-elicitation-unselected-icon)
                             (substring-no-properties text))))
             (should position)
             (let ((command (lookup-key (get-text-property position 'keymap text) (kbd "2"))))
@@ -4856,6 +4919,310 @@ The chord must not send a partial accept by accident."
           (should (equal "JWT"
                          (map-nested-elt state '(:elicitations 28 :answers question_0))))
           (should (map-elt (map-elt state :elicitations) 28)))))))
+
+;;; Tests for multi-select elicitations
+
+(defun agent-shell-tests--multi-select-elicitation (&optional answers)
+  "Return a one-question multi-select elicitation carrying ANSWERS.
+
+See `agent-shell-tests--one-question-elicitation' on why this is built
+with `list' and `cons'."
+  (list (cons :message "Which areas?")
+        (cons :fields
+              (list (list (cons :name 'question_0)
+                          (cons :multi t)
+                          (cons :options
+                                (list (list (cons :value "Parsing") (cons :title "Parsing"))
+                                      (list (cons :value "Rendering") (cons :title "Rendering"))
+                                      (list (cons :value "Errors") (cons :title "Errors")))))))
+        (cons :answers answers)
+        (cons :tool-call-id "toolu_1")))
+
+(defun agent-shell-tests--multi-select-field ()
+  "Return the multi-select field of `agent-shell-tests--multi-select-elicitation'."
+  (car (map-elt (agent-shell-tests--multi-select-elicitation) :fields)))
+
+(ert-deftest agent-shell--elicitation-toggle-selection-adds-test ()
+  "Test a toggle adds an option to an empty selection."
+  (should (equal ["Parsing"]
+                 (agent-shell--elicitation-toggle-selection
+                  (agent-shell-tests--multi-select-field) nil "Parsing"))))
+
+(ert-deftest agent-shell--elicitation-toggle-selection-removes-test ()
+  "Test a toggle removes an option the selection already carries."
+  (should (equal ["Errors"]
+                 (agent-shell--elicitation-toggle-selection
+                  (agent-shell-tests--multi-select-field)
+                  ["Parsing" "Errors"] "Parsing"))))
+
+(ert-deftest agent-shell--elicitation-toggle-selection-orders-by-schema-test ()
+  "Test a selection reads in the question's option order.
+
+Pressing the last option first would otherwise answer out of order, and
+the agent joins the array into one string the model reads."
+  (let ((field (agent-shell-tests--multi-select-field)))
+    (should (equal ["Errors"]
+                   (agent-shell--elicitation-toggle-selection field nil "Errors")))
+    (should (equal ["Parsing" "Errors"]
+                   (agent-shell--elicitation-toggle-selection field ["Errors"] "Parsing")))
+    (should (equal ["Parsing" "Rendering" "Errors"]
+                   (agent-shell--elicitation-toggle-selection
+                    field ["Parsing" "Errors"] "Rendering")))))
+
+(ert-deftest agent-shell--elicitation-toggle-selection-empties-to-nil-test ()
+  "Test clearing the last selected option returns nil.
+
+`agent-shell--answer-elicitation' drops the answer, so the question goes
+back to unanswered rather than carrying an empty array."
+  (should-not (agent-shell--elicitation-toggle-selection
+               (agent-shell-tests--multi-select-field) ["Parsing"] "Parsing")))
+
+(ert-deftest agent-shell--answer-elicitation-drops-emptied-answer-test ()
+  "Test toggling the last selected option leaves the question unanswered."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 30 (agent-shell-tests--multi-select-elicitation
+                            (list (cons 'question_0 ["Parsing"]))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--answer-elicitation
+           :state state :request-id 30 :client 'test-client
+           :field-name 'question_0 :value nil)
+          (should-not responses)
+          (should-not (map-contains-key
+                       (map-nested-elt state '(:elicitations 30 :answers))
+                       'question_0))
+          (should (agent-shell--elicitation-pending-field
+                   (map-nested-elt state '(:elicitations 30)))))))))
+
+(ert-deftest agent-shell--submit-elicitation-sends-a-vector-test ()
+  "Test a multi-select answer reaches the agent as a JSON array.
+
+`acp-make-elicitation-create-response' rejects a list: a list serializes
+as a JSON object and the agent discards the whole content without
+reporting an error.  This test builds the response for real rather than
+through the stub, so that guard runs."
+  (with-temp-buffer
+    (let* ((state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 31 (agent-shell-tests--multi-select-elicitation
+                            (list (cons 'question_0 ["Parsing" "Errors"]))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--update-fragment) (lambda (&rest _)))
+                ((symbol-function 'agent-shell--delete-fragment) (lambda (&rest _)))
+                ((symbol-function 'agent-shell-jump-to-latest-permission-button-row)
+                 (lambda (&rest _) t))
+                ((symbol-function 'agent-shell-viewport--buffer) (lambda (&rest _) nil)))
+        (let (sent)
+          (cl-letf (((symbol-function 'acp-send-response)
+                     (lambda (&rest args) (setq sent (plist-get args :response)))))
+            (agent-shell--submit-elicitation
+             :state state :request-id 31 :client 'test-client))
+          (should (equal ["Parsing" "Errors"]
+                         (map-nested-elt sent '(:result content question_0))))
+          (should (equal "{\"question_0\":[\"Parsing\",\"Errors\"]}"
+                         (json-serialize (map-nested-elt sent '(:result content))))))))))
+
+(ert-deftest agent-shell--make-elicitation-text-marks-every-selected-option-test ()
+  "Test a multi-select question marks each selected option."
+  (with-temp-buffer
+    (let ((text (substring-no-properties
+                 (agent-shell-tests--elicitation-text
+                  (agent-shell-tests--multi-select-elicitation
+                   (list (cons 'question_0 ["Parsing" "Errors"]))))))
+          (checked agent-shell-elicitation-checked-icon)
+          (unchecked agent-shell-elicitation-unchecked-icon))
+      (should (string-search (format "[ %s Parsing (1) ]" checked) text))
+      (should (string-search (format "[ %s Rendering (2) ]" unchecked) text))
+      (should (string-search (format "[ %s Errors (3) ]" checked) text))
+      ;; A checkbox, not the single-select radio.
+      (should-not (string-search agent-shell-elicitation-selected-icon text))
+      (should-not (string-search agent-shell-elicitation-unselected-icon text)))))
+
+(ert-deftest agent-shell--make-elicitation-text-digit-toggles-test ()
+  "Test a digit hotkey adds to a multi-select answer rather than replacing it."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 32 (agent-shell-tests--multi-select-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (let ((text (agent-shell--make-elicitation-text
+                       :elicitation (map-elt (map-elt state :elicitations) 32)
+                       :request-id 32
+                       :client 'test-client
+                       :state state)))
+            (funcall (agent-shell-tests--elicitation-option-command
+                      text "Parsing" "1"
+                      :glyph agent-shell-elicitation-unchecked-icon))
+            (funcall (agent-shell-tests--elicitation-option-command
+                      text "Errors" "3"
+                      :glyph agent-shell-elicitation-unchecked-icon)))
+          (should-not responses)
+          (should (equal ["Parsing" "Errors"]
+                         (map-nested-elt state '(:elicitations 32 :answers question_0)))))))))
+
+(ert-deftest agent-shell--make-elicitation-text-digit-untoggles-test ()
+  "Test a digit hotkey on a selected option removes it."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 33 (agent-shell-tests--multi-select-elicitation
+                            (list (cons 'question_0 ["Parsing" "Errors"]))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (funcall (agent-shell-tests--elicitation-option-command
+                    (agent-shell--make-elicitation-text
+                     :elicitation (map-elt (map-elt state :elicitations) 33)
+                     :request-id 33
+                     :client 'test-client
+                     :state state)
+                    "Parsing" "1"
+                    :glyph agent-shell-elicitation-checked-icon))
+          (should-not responses)
+          (should (equal ["Errors"]
+                         (map-nested-elt state '(:elicitations 33 :answers question_0)))))))))
+
+(ert-deftest agent-shell--make-elicitation-text-multi-select-control-return-submits-test ()
+  "Test `C-<return>' on a multi-select option adds it and sends the form."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 34 (agent-shell-tests--multi-select-elicitation
+                            (list (cons 'question_0 ["Parsing"]))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (funcall (agent-shell-tests--elicitation-option-command
+                    (agent-shell--make-elicitation-text
+                     :elicitation (map-elt (map-elt state :elicitations) 34)
+                     :request-id 34
+                     :client 'test-client
+                     :state state)
+                    "Errors" "C-<return>"
+                    :glyph agent-shell-elicitation-unchecked-icon))
+          (should (equal 1 (length responses)))
+          (should (equal "accept" (map-nested-elt (car responses) '(:result action))))
+          (should (equal ["Parsing" "Errors"]
+                         (map-nested-elt (car responses) '(:result content question_0)))))))))
+
+(ert-deftest agent-shell--make-elicitation-text-multi-select-control-return-defers-on-empty-test ()
+  "Test `C-<return>' that clears the last option toggles alone.
+
+Submitting there would send a form whose only answer the chord just
+removed."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 35 (agent-shell-tests--multi-select-elicitation
+                            (list (cons 'question_0 ["Parsing"]))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (funcall (agent-shell-tests--elicitation-option-command
+                    (agent-shell--make-elicitation-text
+                     :elicitation (map-elt (map-elt state :elicitations) 35)
+                     :request-id 35
+                     :client 'test-client
+                     :state state)
+                    "Parsing" "C-<return>"
+                    :glyph agent-shell-elicitation-checked-icon))
+          (should-not responses)
+          (should (map-elt (map-elt state :elicitations) 35))
+          (should-not (map-nested-elt state '(:elicitations 35 :answers question_0))))))))
+
+(ert-deftest agent-shell--make-elicitation-text-focuses-toggled-option-test ()
+  "Test point stays on the option a toggle just acted on.
+
+Each question's digit hotkeys ride on that question's own buttons, so
+moving point to the next question would send the next digit to the wrong
+question."
+  (with-temp-buffer
+    (let ((elicitation (agent-shell-tests--multi-select-elicitation
+                        (list (cons 'question_0 ["Rendering"])))))
+      (setf (map-elt elicitation :focus-option) (cons 'question_0 "Rendering"))
+      (should (equal (format "[ %s Rendering (2) ]" agent-shell-elicitation-checked-icon)
+                     (agent-shell-tests--focus-button-text
+                      (agent-shell-tests--elicitation-text elicitation)))))))
+
+(ert-deftest agent-shell--make-elicitation-toggle-command-records-focus-test ()
+  "Test a toggle marks its option as the one point returns to."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 36 (agent-shell-tests--multi-select-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (funcall (agent-shell--make-elicitation-toggle-command
+                    :state state
+                    :request-id 36
+                    :client 'test-client
+                    :field (car (map-nested-elt state '(:elicitations 36 :fields)))
+                    :value "Errors"))
+          (should (equal (cons 'question_0 "Errors")
+                         (map-nested-elt state '(:elicitations 36 :focus-option)))))))))
+
+(ert-deftest agent-shell--answer-elicitation-clears-focus-option-test ()
+  "Test a single-select answer returns point to the first blank question."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (let ((elicitation (agent-shell-tests--two-question-elicitation)))
+        (setf (map-elt elicitation :focus-option) (cons 'question_0 "JWT"))
+        (setf (map-elt state :elicitations) (list (cons 37 elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--answer-elicitation
+           :state state :request-id 37 :client 'test-client
+           :field-name 'question_0 :value "JWT")
+          (should-not (map-nested-elt state '(:elicitations 37 :focus-option))))))))
+
+(ert-deftest agent-shell--on-request-saves-multi-select-elicitation-test ()
+  "Test a multi-select schema is stored rather than declined."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--on-request
+           :state state
+           :acp-request '((id . 38)
+                          (method . "elicitation/create")
+                          (params . ((mode . "form")
+                                     (sessionId . "sess-1")
+                                     (toolCallId . "toolu_1")
+                                     (message . "Which areas?")
+                                     (requestedSchema
+                                      . ((type . "object")
+                                         (properties . ((question_0 . ((type . "array")
+                                                                       (items . ((anyOf . [((const . "Parsing") (title . "Parsing"))
+                                                                                           ((const . "Errors") (title . "Errors"))])))))))))))))
+          (should-not responses)
+          (let ((field (car (map-nested-elt state '(:elicitations 38 :fields)))))
+            (should (map-elt field :multi))
+            (should (equal '("Parsing" "Errors")
+                           (mapcar (lambda (option) (map-elt option :value))
+                                   (map-elt field :options))))))))))
 
 (ert-deftest agent-shell-restart-preserves-default-directory ()
   "Restart should use the shell's directory, not the fallback buffer's.
