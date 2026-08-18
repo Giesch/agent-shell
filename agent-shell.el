@@ -9257,17 +9257,46 @@ empty or carries an option this shell cannot render.  See
               ((not (memq nil options))))
     options))
 
-(defun agent-shell--elicitation-field (name spec)
-  "Make a field named NAME from schema SPEC.
+(defun agent-shell--elicitation-custom-field (name spec)
+  "Make the Other box named NAME from schema SPEC.
 
-Returns an alist with keys :name, :title, :description, :multi, and
-:options, or nil when SPEC is neither a single-select nor a multi-select
-field whose options this shell can render.
+SPEC is a `requestedSchema' property marked with
+`_meta._askUserQuestionCustomAnswer': the free-text companion of one
+question.  Returns an alist with keys :name, :question, :title, and
+:description, or nil when SPEC is not a plain string field or names no
+question.
+
+For example, the property `question_0_custom' returns:
+
+  ((:name . question_0_custom)
+   (:question . question_0)
+   (:title . \"Other\")
+   (:description . \"Type your own answer instead of choosing an option\"))"
+  (when-let* (((equal (map-elt spec 'type) "string"))
+              ((not (map-elt spec 'oneOf)))
+              (question (map-nested-elt spec '(_meta _askUserQuestionCustomAnswer questionId)))
+              ((stringp question)))
+    (let ((title (map-elt spec 'title))
+          (description (map-elt spec 'description)))
+      (list (cons :name name)
+            (cons :question (intern question))
+            (cons :title (if (stringp title) title "Other"))
+            (cons :description (when (stringp description) description))))))
+
+(defun agent-shell--elicitation-field (name spec custom)
+  "Make a field named NAME from schema SPEC, offering CUSTOM.
+
+Returns an alist with keys :name, :title, :description, :multi, :options,
+and :custom, or nil when SPEC is neither a single-select nor a
+multi-select field whose options this shell can render.
 
 A single-select field is a string with a `oneOf' enum and answers with one
 option label.  A multi-select field is an array whose `items' carry an
 `anyOf' enum, and answers with a vector of option labels.  :multi is
-non-nil for the second."
+non-nil for the second.
+
+CUSTOM is the field's Other box, or nil when the schema offers none.  See
+`agent-shell--elicitation-custom-field'."
   (let* ((type (map-elt spec 'type))
          (multi (equal type "array"))
          (options (agent-shell--elicitation-options
@@ -9280,7 +9309,8 @@ non-nil for the second."
               (cons :title (when (stringp title) title))
               (cons :description (when (stringp description) description))
               (cons :multi multi)
-              (cons :options options))))))
+              (cons :options options)
+              (cons :custom custom))))))
 
 (defun agent-shell--elicitation-form-fields (requested-schema)
   "Return the renderable fields of REQUESTED-SCHEMA, or `unsupported'.
@@ -9295,29 +9325,54 @@ single-select nor a multi-select.  An unrenderable form is declined,
 which is what the agent falls back to on its own.  Sending a partial
 answer instead would put words in the user's mouth.
 
-A field marked as a custom answer is skipped.  It is an optional
-companion to a question, and no schema listing one marks it required."
+A field marked as a custom answer is one question's Other box rather than
+a question of its own.  Such fields are collected first, then attached to
+the question each one names, so a box listed before its question still
+reaches it.  A box that names no question in the schema is dropped: it is
+optional and no schema listing one marks it required, so declining the
+whole form over it would lose a form this shell renders."
   (if (or (not (listp requested-schema))
           (map-contains-key requested-schema 'required))
       'unsupported
-    (catch 'unsupported
-      (let ((fields '()))
-        (map-do
-         (lambda (name spec)
-           (unless (map-nested-elt spec '(_meta _askUserQuestionCustomAnswer))
-             (if-let* ((field (agent-shell--elicitation-field name spec)))
-                 (push field fields)
-               (throw 'unsupported 'unsupported))))
-         (map-elt requested-schema 'properties))
-        (if fields
-            (nreverse fields)
-          'unsupported)))))
+    (let ((properties (map-elt requested-schema 'properties))
+          (customs '()))
+      (map-do (lambda (name spec)
+                (when-let* (((map-nested-elt spec '(_meta _askUserQuestionCustomAnswer)))
+                            (custom (agent-shell--elicitation-custom-field name spec)))
+                  (push custom customs)))
+              properties)
+      (catch 'unsupported
+        (let ((fields '()))
+          (map-do
+           (lambda (name spec)
+             (unless (map-nested-elt spec '(_meta _askUserQuestionCustomAnswer))
+               (if-let* ((field (agent-shell--elicitation-field
+                                 name spec
+                                 (seq-find (lambda (custom)
+                                             (eq (map-elt custom :question) name))
+                                           customs))))
+                   (push field fields)
+                 (throw 'unsupported 'unsupported))))
+           properties)
+          (if fields
+              (nreverse fields)
+            'unsupported))))))
+
+(defun agent-shell--elicitation-field-answered-p (answers field)
+  "Return non-nil when ANSWERS carries an answer to FIELD.
+
+A question is answered through its options or through its Other box.  The
+agent prefers a non-empty Other box over the options, so either one
+answers the question."
+  (or (map-contains-key answers (map-elt field :name))
+      (when-let* ((custom (map-nested-elt field '(:custom :name))))
+        (map-contains-key answers custom))))
 
 (defun agent-shell--elicitation-pending-field (elicitation)
   "Return the first unanswered field of ELICITATION, or nil."
   (let ((answers (map-elt elicitation :answers)))
     (seq-find (lambda (field)
-                (not (map-contains-key answers (map-elt field :name))))
+                (not (agent-shell--elicitation-field-answered-p answers field)))
               (map-elt elicitation :fields))))
 
 (defun agent-shell--elicitation-answer-completes-p (elicitation field)
@@ -9328,7 +9383,7 @@ one-question form always satisfies this."
   (let ((answers (map-elt elicitation :answers)))
     (seq-every-p (lambda (other)
                    (or (eq other field)
-                       (map-contains-key answers (map-elt other :name))))
+                       (agent-shell--elicitation-field-answered-p answers other)))
                  (map-elt elicitation :fields))))
 
 (defun agent-shell--elicitation-field-label (field fallback)
@@ -9362,18 +9417,23 @@ Returns nil when the toggle leaves nothing selected, which
     (when ordered
       (vconcat (mapcar (lambda (option) (map-elt option :value)) ordered)))))
 
-(cl-defun agent-shell--make-elicitation-answer-command (&key state request-id client field-name value submit)
-  "Return a command recording VALUE as the answer to FIELD-NAME.
+(cl-defun agent-shell--make-elicitation-answer-command (&key state request-id client field value submit)
+  "Return a command recording VALUE as the answer to FIELD.
 
 STATE, REQUEST-ID, and CLIENT identify the elicitation to update.
-When SUBMIT is non-nil, the command also sends the form."
+When SUBMIT is non-nil, the command also sends the form.
+
+The command drops FIELD's Other box.  An option and free text both answer
+the question, and the agent prefers the free text, so a stale box would
+outrank the option just pressed."
   (lambda ()
     (interactive)
     (agent-shell--answer-elicitation
      :state state
      :request-id request-id
      :client client
-     :field-name field-name
+     :field-name (map-elt field :name)
+     :clear (map-nested-elt field '(:custom :name))
      :value value
      :submit submit)))
 
@@ -9394,12 +9454,126 @@ is rendered, so a stale button cannot resurrect an old selection."
        :request-id request-id
        :client client
        :field-name field-name
+       :clear (map-nested-elt field '(:custom :name))
        :value (agent-shell--elicitation-toggle-selection
                field
                (map-nested-elt state (list :elicitations request-id :answers field-name))
                value)
        :focus-option (cons field-name value)
        :submit submit))))
+
+(defun agent-shell--elicitation-custom-prompt (field)
+  "Return the minibuffer prompt for FIELD's Other box.
+
+Names the question when the schema gives it a short title, so a
+multi-question form says which question the minibuffer asks about.
+
+For example, \"Other (Auth): \" or \"Other: \"."
+  (if (map-elt field :title)
+      (format "%s (%s): "
+              (map-nested-elt field '(:custom :title))
+              (map-elt field :title))
+    (format "%s: " (map-nested-elt field '(:custom :title)))))
+
+(cl-defun agent-shell--make-elicitation-custom-command (&key state request-id client field submit)
+  "Return a command reading FIELD's Other box from the minibuffer.
+
+STATE, REQUEST-ID, and CLIENT identify the elicitation to update.  The
+prompt is seeded with the text already recorded, so an answer can be
+edited rather than retyped.
+
+The text is trimmed.  Empty text drops the Other box and leaves any
+option the question already carries.  When SUBMIT is non-nil the command
+also sends the form, but only for non-empty text, so the chord never
+sends a form the prompt just emptied.
+
+Free text is read in the minibuffer rather than in the form.  The
+fragment's text is read-only and every answer rewrites it."
+  (lambda ()
+    (interactive)
+    (let* ((custom-name (map-nested-elt field '(:custom :name)))
+           (text (string-trim
+                  (read-string
+                   (agent-shell--elicitation-custom-prompt field)
+                   (map-nested-elt state (list :elicitations request-id
+                                               :answers custom-name))))))
+      (agent-shell--answer-elicitation
+       :state state
+       :request-id request-id
+       :client client
+       :field-name custom-name
+       :clear (map-elt field :name)
+       :value (unless (string-empty-p text) text)
+       :submit (and submit (not (string-empty-p text)))))))
+
+(defun agent-shell--elicitation-glyph (multi selected)
+  "Return the mark an option carries, SELECTED or not.
+
+A radio marks a question that takes one answer, a checkbox one that takes
+several, so MULTI picks the pair.
+
+A glyph rather than a face: the button frame is a box in a graphical
+frame and brackets in a terminal, so a background colour would not read
+the same in both."
+  (cond ((and multi selected) agent-shell-elicitation-checked-icon)
+        (multi agent-shell-elicitation-unchecked-icon)
+        (selected agent-shell-elicitation-selected-icon)
+        (t agent-shell-elicitation-unselected-icon)))
+
+(cl-defun agent-shell--make-elicitation-custom-button (&key state request-id client field answer completes keymap)
+  "Create the Other button of FIELD, carrying ANSWER.
+
+ANSWER is the free text FIELD's Other box already holds, or nil.  The
+button shows it, truncated, so the answer is readable before the form is
+submitted.
+
+COMPLETES is non-nil when answering FIELD completes the form, which is
+what `C-<return>' needs to submit.  KEYMAP is the question's keymap,
+which the button's own keymap extends.  STATE, REQUEST-ID, and CLIENT
+identify the elicitation to update.
+
+The button carries the glyph of its question rather than a radio in every
+form, so one row reads as one kind of question.  Recording free text
+drops the question's selection, so the cleared options already show that
+the box replaces them.
+
+For example:
+
+  \"[ ● Other: use OAuth (o) ]\""
+  (let ((button-keymap (make-sparse-keymap)))
+    (set-keymap-parent button-keymap keymap)
+    ;; "C-<return>" acts on the button point sits on, so it binds below
+    ;; the question's "o".
+    (define-key button-keymap (kbd "C-<return>")
+                (agent-shell--make-elicitation-custom-command
+                 :state state
+                 :request-id request-id
+                 :client client
+                 :field field
+                 :submit completes))
+    (agent-shell--make-permission-button
+     ;; The hotkey stays last: `agent-shell--make-permission-button'
+     ;; derives the navigatable character from the trailing "(x)".
+     :text (format "%s %s%s (o)"
+                   (agent-shell--elicitation-glyph (map-elt field :multi) answer)
+                   (map-nested-elt field '(:custom :title))
+                   (if answer
+                       (format ": %s" (truncate-string-to-width answer 32 0 nil t))
+                     ""))
+     :help (or (map-nested-elt field '(:custom :description))
+               "Type your own answer")
+     :action (agent-shell--make-elicitation-custom-command
+              :state state
+              :request-id request-id
+              :client client
+              :field field
+              :submit nil)
+     :keymap button-keymap
+     :navigatable t
+     :char "o"
+     :option (if completes
+                 "type your own answer, or C-RET to type it and submit"
+               "type your own answer"))))
 
 (cl-defun agent-shell--make-elicitation-text (&key elicitation request-id client state)
   "Create text to render the question form for ELICITATION.
@@ -9410,15 +9584,18 @@ client used to send the response.
 Every question renders its options as buttons, numbered for hotkey
 access.  A single-select question renders radios and a press replaces its
 answer.  A multi-select question renders checkboxes and a press toggles
-one option.  The form carries a Submit button and sends the answers when
+one option.  A question whose schema offers a free-text box renders an
+Other button after its options, and a press reads the text from the
+minibuffer.  The form carries a Submit button and sends the answers when
 it is pressed.
 
-`C-<return>' on an option records that answer and submits the form.  It
-submits only when every other question already carries an answer, and a
-multi-select toggle that clears the last selected option never submits.
-Elsewhere it records the answer alone, so the chord never sends a
-partial accept.  A terminal sends the same byte for `RET' and
-`C-<return>', so the chord records the answer alone there too.
+`C-<return>' on an option or on Other records that answer and submits the
+form.  It submits only when every other question already carries an
+answer, a multi-select toggle that clears the last selected option never
+submits, and neither does an Other box left empty.  Elsewhere it records
+the answer alone, so the chord never sends a partial accept.  A terminal
+sends the same byte for `RET' and `C-<return>', so the chord records the
+answer alone there too.
 
 Point lands on the option a multi-select toggle just acted on, else on
 the first option of the first unanswered question, else on Submit.  See
@@ -9436,11 +9613,11 @@ For example:
 
        Which auth approach?
 
-       [ ● JWT (1) ] [ ○ Session (2) ]
+       [ ● JWT (1) ] [ ○ Session (2) ] [ ○ Other (o) ]
 
        Which areas should the tests cover?
 
-       [ ✓ Parsing (1) ] [ □ Rendering (2) ] [ ✓ Errors (3) ]
+       [ ✓ Parsing (1) ] [ □ Rendering (2) ] [ ✓ Errors (3) ] [ □ Other (o) ]
 
        [ Submit (c) ] [ Skip (s) ]
 
@@ -9492,6 +9669,7 @@ For example:
                                              field (when single message))
                                             'font-lock-face 'agent-shell-input))
                          (answer (map-elt answers (map-elt field :name)))
+                         (custom-answer (map-elt answers (map-nested-elt field '(:custom :name))))
                          (completes (agent-shell--elicitation-answer-completes-p
                                      elicitation field))
                          (field-keymap (make-sparse-keymap))
@@ -9511,7 +9689,7 @@ For example:
                                :state state
                                :request-id request-id
                                :client client
-                               :field-name (map-elt field :name)
+                               :field field
                                :value (map-elt option :value)
                                :submit submit)))))
                     (set-keymap-parent field-keymap keymap)
@@ -9521,76 +9699,82 @@ For example:
                          (define-key field-keymap (kbd (number-to-string (1+ index)))
                                      (funcall option-command option nil))))
                      (map-elt field :options))
+                    (when (map-elt field :custom)
+                      (define-key field-keymap (kbd "o")
+                                  (agent-shell--make-elicitation-custom-command
+                                   :state state
+                                   :request-id request-id
+                                   :client client
+                                   :field field
+                                   :submit nil)))
                     (format "%s\n\n    %s" label
                             (string-join
-                             (seq-map-indexed
-                              (lambda (option index)
-                                (let* ((hotkey (when (< index 9)
-                                                 (number-to-string (1+ index))))
-                                       (value (map-elt option :value))
-                                       (selected (if multi
-                                                     (seq-contains-p answer value)
-                                                   (equal answer value)))
-                                       ;; A glyph rather than a face: the
-                                       ;; button frame is a box in a
-                                       ;; graphical frame and brackets in a
-                                       ;; terminal, so a background colour
-                                       ;; would not read the same in both.
-                                       ;; A radio marks a question that takes
-                                       ;; one answer, a checkbox one that
-                                       ;; takes several.
-                                       (glyph (cond ((and multi selected)
-                                                     agent-shell-elicitation-checked-icon)
-                                                    (multi
-                                                     agent-shell-elicitation-unchecked-icon)
-                                                    (selected
-                                                     agent-shell-elicitation-selected-icon)
-                                                    (t
-                                                     agent-shell-elicitation-unselected-icon)))
-                                       (verb (cond ((not multi) "answer")
-                                                   (selected "unselect")
-                                                   (t "select")))
-                                       ;; A multi-select press that clears the
-                                       ;; last selected option leaves the
-                                       ;; question unanswered, so the chord
-                                       ;; toggles alone rather than submitting
-                                       ;; a form it just emptied.
-                                       (chord-submits
-                                        (and completes
-                                             (or (not multi)
-                                                 (and (agent-shell--elicitation-toggle-selection
-                                                       field answer value)
-                                                      t))))
-                                       ;; "C-<return>" acts on the option
-                                       ;; point sits on, so it binds below
-                                       ;; the question's digits.
-                                       (option-keymap (make-sparse-keymap)))
-                                  (set-keymap-parent option-keymap field-keymap)
-                                  (define-key option-keymap (kbd "C-<return>")
-                                              (funcall option-command option chord-submits))
-                                  (agent-shell--make-permission-button
-                                   ;; The hotkey stays last:
-                                   ;; `agent-shell--make-permission-button'
-                                   ;; derives the navigatable character
-                                   ;; from the trailing "(x)".
-                                   :text (if hotkey
-                                             (format "%s %s (%s)" glyph (map-elt option :title) hotkey)
-                                           (format "%s %s" glyph (map-elt option :title)))
-                                   :help (or (map-elt option :description)
-                                             (map-elt option :title))
-                                   :action (funcall option-command option nil)
-                                   :keymap option-keymap
-                                   :navigatable t
-                                   :char hotkey
-                                   :focus (if focus-option
-                                              (and (equal (car focus-option) (map-elt field :name))
-                                                   (equal (cdr focus-option) value))
-                                            (and (eq field pending) (= index 0)))
-                                   :option (if chord-submits
-                                               (format "%s %s, or C-RET to %s and submit"
-                                                       verb (map-elt option :title) verb)
-                                             (format "%s %s" verb (map-elt option :title))))))
-                              (map-elt field :options))
+                             (append
+                              (seq-map-indexed
+                               (lambda (option index)
+                                 (let* ((hotkey (when (< index 9)
+                                                  (number-to-string (1+ index))))
+                                        (value (map-elt option :value))
+                                        (selected (if multi
+                                                      (seq-contains-p answer value)
+                                                    (equal answer value)))
+                                        (verb (cond ((not multi) "answer")
+                                                    (selected "unselect")
+                                                    (t "select")))
+                                        ;; A multi-select press that clears the
+                                        ;; last selected option leaves the
+                                        ;; question unanswered, so the chord
+                                        ;; toggles alone rather than submitting
+                                        ;; a form it just emptied.
+                                        (chord-submits
+                                         (and completes
+                                              (or (not multi)
+                                                  (and (agent-shell--elicitation-toggle-selection
+                                                        field answer value)
+                                                       t))))
+                                        ;; "C-<return>" acts on the option
+                                        ;; point sits on, so it binds below
+                                        ;; the question's digits.
+                                        (option-keymap (make-sparse-keymap)))
+                                   (set-keymap-parent option-keymap field-keymap)
+                                   (define-key option-keymap (kbd "C-<return>")
+                                               (funcall option-command option chord-submits))
+                                   (agent-shell--make-permission-button
+                                    ;; The hotkey stays last:
+                                    ;; `agent-shell--make-permission-button'
+                                    ;; derives the navigatable character
+                                    ;; from the trailing "(x)".
+                                    :text (if hotkey
+                                              (format "%s %s (%s)"
+                                                      (agent-shell--elicitation-glyph multi selected)
+                                                      (map-elt option :title) hotkey)
+                                            (format "%s %s"
+                                                    (agent-shell--elicitation-glyph multi selected)
+                                                    (map-elt option :title)))
+                                    :help (or (map-elt option :description)
+                                              (map-elt option :title))
+                                    :action (funcall option-command option nil)
+                                    :keymap option-keymap
+                                    :navigatable t
+                                    :char hotkey
+                                    :focus (if focus-option
+                                               (and (equal (car focus-option) (map-elt field :name))
+                                                    (equal (cdr focus-option) value))
+                                             (and (eq field pending) (= index 0)))
+                                    :option (if chord-submits
+                                                (format "%s %s, or C-RET to %s and submit"
+                                                        verb (map-elt option :title) verb)
+                                              (format "%s %s" verb (map-elt option :title))))))
+                               (map-elt field :options))
+                              (when (map-elt field :custom)
+                                (list (agent-shell--make-elicitation-custom-button
+                                       :state state
+                                       :request-id request-id
+                                       :client client
+                                       :field field
+                                       :answer custom-answer
+                                       :completes completes
+                                       :keymap field-keymap))))
                              " "))))
                 fields)))
     (format "╭─
@@ -9660,7 +9844,28 @@ the same block id, so a recorded answer replaces the form in place."
       (with-current-buffer viewport-buffer
         (agent-shell--jump-to-focus-button)))))
 
-(cl-defun agent-shell--answer-elicitation (&key state request-id client field-name value submit focus-option)
+(defun agent-shell--elicitation-record-answer (answers field-name value clear)
+  "Return ANSWERS with VALUE recorded as the answer to FIELD-NAME.
+
+A nil VALUE drops FIELD-NAME, so the question is unanswered again.
+
+CLEAR names the field FIELD-NAME answers instead of.  A question's
+options and its Other box are exclusive: both answer the question and the
+agent prefers the Other box, so recording one drops the other.  A nil
+VALUE drops nothing else, so emptying the Other box leaves the option
+standing.
+
+For example:
+
+  (agent-shell--elicitation-record-answer
+   \\='((question_0_custom . \"OAuth\")) \\='question_0 \"JWT\" \\='question_0_custom)
+  => ((question_0 . \"JWT\"))"
+  (if value
+      (map-insert (if clear (map-delete (copy-alist answers) clear) answers)
+                  field-name value)
+    (map-delete (copy-alist answers) field-name)))
+
+(cl-defun agent-shell--answer-elicitation (&key state request-id client field-name value clear submit focus-option)
   "Record VALUE as the answer to FIELD-NAME in elicitation REQUEST-ID.
 
 Re-renders the form, so the answer can be replaced until it is submitted.
@@ -9670,6 +9875,9 @@ A nil VALUE drops the answer, so the question is unanswered again.  A
 multi-select question whose last selected option is toggled off passes
 nil.  The form keys on the presence of an answer, and the agent drops an
 empty one, so the two would otherwise disagree.
+
+CLEAR names a field whose answer is dropped alongside.  See
+`agent-shell--elicitation-record-answer'.
 
 FOCUS-OPTION is a cons of a field name and an option value, marking the
 option point lands on after the re-render.  A nil FOCUS-OPTION returns
@@ -9682,12 +9890,11 @@ to send the response."
                 ;; `answers' is nil until the first answer lands, so it is
                 ;; read below rather than bound here: a nil binding would
                 ;; short-circuit `when-let*'.
-                (updated (let ((answers (map-elt elicitation :answers)))
-                           (map-insert (map-insert elicitation :focus-option focus-option)
-                                       :answers
-                                       (if value
-                                           (map-insert answers field-name value)
-                                         (map-delete (copy-alist answers) field-name))))))
+                (updated (map-insert
+                          (map-insert elicitation :focus-option focus-option)
+                          :answers
+                          (agent-shell--elicitation-record-answer
+                           (map-elt elicitation :answers) field-name value clear))))
       (agent-shell--save-elicitation state request-id updated)
       (if submit
           (agent-shell--submit-elicitation

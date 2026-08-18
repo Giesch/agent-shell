@@ -4061,7 +4061,8 @@ Gemini sends these fields as empty arrays."
                             (:description . "Stateless"))
                            ((:value . "Session")
                             (:title . "Session")
-                            (:description))))))
+                            (:description))))
+              (:custom)))
            (agent-shell--elicitation-form-fields
             '((type . "object")
               (properties . ((question_0 . ((type . "string")
@@ -4105,11 +4106,11 @@ single-select, so it renders through the same path."
                                                     (description . "Second?")
                                                     (oneOf . [((const . "b") (title . "b"))])))))))))))
 
-(ert-deftest agent-shell--elicitation-form-fields-skips-custom-answer-test ()
-  "Test `agent-shell--elicitation-form-fields' skips a custom answer field.
+(ert-deftest agent-shell--elicitation-form-fields-attaches-custom-answer-test ()
+  "Test `agent-shell--elicitation-form-fields' attaches a custom answer field.
 
-The field is optional and no schema carrying one marks it required, so
-skipping it still produces a valid answer."
+The field is one question's Other box rather than a question of its own,
+so the form still carries one field."
   (let ((fields (agent-shell--elicitation-form-fields
                  '((type . "object")
                    (properties . ((question_0 . ((type . "string")
@@ -4117,11 +4118,71 @@ skipping it still produces a valid answer."
                                   (question_0_custom
                                    . ((type . "string")
                                       (title . "Other")
+                                      (description . "Type your own answer")
                                       (_meta . ((_askUserQuestionCustomAnswer
                                                  . ((questionId . "question_0")
                                                     (isCustomAnswer . t)))))))))))))
     (should (equal 1 (length fields)))
-    (should (equal 'question_0 (map-elt (car fields) :name)))))
+    (should (equal 'question_0 (map-elt (car fields) :name)))
+    (should (equal '((:name . question_0_custom)
+                     (:question . question_0)
+                     (:title . "Other")
+                     (:description . "Type your own answer"))
+                   (map-elt (car fields) :custom)))))
+
+(ert-deftest agent-shell--elicitation-form-fields-attaches-custom-answer-listed-first-test ()
+  "Test a custom answer field reaches a question the schema lists after it.
+
+The walk collects the boxes before it walks the questions, so schema
+order cannot orphan one."
+  (should (equal 'question_0_custom
+                 (map-nested-elt
+                  (car (agent-shell--elicitation-form-fields
+                        '((type . "object")
+                          (properties
+                           . ((question_0_custom
+                               . ((type . "string")
+                                  (title . "Other")
+                                  (_meta . ((_askUserQuestionCustomAnswer
+                                             . ((questionId . "question_0")))))))
+                              (question_0 . ((type . "string")
+                                             (oneOf . [((const . "a") (title . "a"))]))))))))
+                  '(:custom :name)))))
+
+(ert-deftest agent-shell--elicitation-form-fields-drops-orphan-custom-answer-test ()
+  "Test a custom answer field naming no question is dropped.
+
+The box is optional and no schema listing one marks it required, so
+declining the whole form over it would lose a form this shell renders."
+  (let ((fields (agent-shell--elicitation-form-fields
+                 '((type . "object")
+                   (properties . ((question_0 . ((type . "string")
+                                                 (oneOf . [((const . "a") (title . "a"))])))
+                                  (question_9_custom
+                                   . ((type . "string")
+                                      (title . "Other")
+                                      (_meta . ((_askUserQuestionCustomAnswer
+                                                 . ((questionId . "question_9")))))))))))))
+    (should (equal 1 (length fields)))
+    (should-not (map-elt (car fields) :custom))))
+
+(ert-deftest agent-shell--elicitation-form-fields-drops-non-string-custom-answer-test ()
+  "Test a custom answer field this shell cannot read is dropped.
+
+The box is read as one line of text, so a field of another type is not
+one this shell can offer."
+  (should-not
+   (map-elt (car (agent-shell--elicitation-form-fields
+                  '((type . "object")
+                    (properties
+                     . ((question_0 . ((type . "string")
+                                       (oneOf . [((const . "a") (title . "a"))])))
+                        (question_0_custom
+                         . ((type . "number")
+                            (title . "Other")
+                            (_meta . ((_askUserQuestionCustomAnswer
+                                       . ((questionId . "question_0"))))))))))))
+            :custom)))
 
 (ert-deftest agent-shell--elicitation-form-fields-multi-select-test ()
   "Test `agent-shell--elicitation-form-fields' walks a multi-select question.
@@ -4138,7 +4199,8 @@ The field is marked :multi, which the form renders as checkboxes."
                             (:description . "The reader"))
                            ((:value . "Rendering")
                             (:title . "Rendering")
-                            (:description))))))
+                            (:description))))
+              (:custom)))
            (agent-shell--elicitation-form-fields
             '((type . "object")
               (properties . ((question_0 . ((type . "array")
@@ -5772,6 +5834,248 @@ with \"Method not found\"."
                    (setq sent-method (map-elt (plist-get args :request) :method)))))
         (agent-shell--refresh-session-title)
         (should (equal sent-method "session/list"))))))
+
+;;; Tests for elicitation Other boxes
+
+(defun agent-shell-tests--custom-answer-elicitation (&optional answers)
+  "Return a one-question elicitation offering an Other box, carrying ANSWERS.
+
+See `agent-shell-tests--one-question-elicitation' on why this is built
+with `list' and `cons'."
+  (list (cons :message "Which auth approach?")
+        (cons :fields
+              (list (list (cons :name 'question_0)
+                          (cons :title "Auth")
+                          (cons :options
+                                (list (list (cons :value "JWT") (cons :title "JWT"))
+                                      (list (cons :value "Session") (cons :title "Session"))))
+                          (cons :custom
+                                (list (cons :name 'question_0_custom)
+                                      (cons :question 'question_0)
+                                      (cons :title "Other")
+                                      (cons :description "Type your own answer"))))))
+        (cons :answers answers)
+        (cons :tool-call-id "toolu_1")))
+
+(defun agent-shell-tests--custom-answer-field ()
+  "Return the field of `agent-shell-tests--custom-answer-elicitation'."
+  (car (map-elt (agent-shell-tests--custom-answer-elicitation) :fields)))
+
+(ert-deftest agent-shell--elicitation-record-answer-clears-the-other-key-test ()
+  "Test recording one answer drops the key it answers instead of.
+
+A question's options and its Other box are exclusive.  The agent prefers
+a non-empty box, so a stale one would outrank the option just pressed."
+  (should (equal '((question_0 . "JWT"))
+                 (agent-shell--elicitation-record-answer
+                  '((question_0_custom . "OAuth")) 'question_0 "JWT" 'question_0_custom)))
+  (should (equal '((question_0_custom . "OAuth"))
+                 (agent-shell--elicitation-record-answer
+                  '((question_0 . "JWT")) 'question_0_custom "OAuth" 'question_0))))
+
+(ert-deftest agent-shell--elicitation-record-answer-keeps-the-other-key-when-emptied-test ()
+  "Test emptying the Other box leaves the option the question carries.
+
+Clearing is not answering, so it drops nothing else."
+  (should (equal '((question_0 . "JWT"))
+                 (agent-shell--elicitation-record-answer
+                  '((question_0 . "JWT") (question_0_custom . "OAuth"))
+                  'question_0_custom nil 'question_0))))
+
+(ert-deftest agent-shell--elicitation-field-answered-p-counts-the-other-box-test ()
+  "Test free text answers a question its options do not.
+
+A question answered only through its Other box must not read as pending,
+or point never advances and `C-<return>' never submits."
+  (let ((field (agent-shell-tests--custom-answer-field)))
+    (should-not (agent-shell--elicitation-field-answered-p nil field))
+    (should (agent-shell--elicitation-field-answered-p '((question_0 . "JWT")) field))
+    (should (agent-shell--elicitation-field-answered-p
+             '((question_0_custom . "OAuth")) field))))
+
+(ert-deftest agent-shell--elicitation-pending-field-skips-a-custom-answer-test ()
+  "Test a question answered through its Other box is not pending."
+  (should-not (agent-shell--elicitation-pending-field
+               (agent-shell-tests--custom-answer-elicitation
+                (list (cons 'question_0_custom "OAuth"))))))
+
+(ert-deftest agent-shell--make-elicitation-custom-command-records-typed-text-test ()
+  "Test the Other button records trimmed text and drops the selection."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 40 (agent-shell-tests--custom-answer-elicitation
+                            (list (cons 'question_0 "JWT"))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _)))
+                ((symbol-function 'read-string) (lambda (&rest _) "  OAuth  ")))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (funcall (agent-shell--make-elicitation-custom-command
+                    :state state :request-id 40 :client 'test-client
+                    :field (agent-shell-tests--custom-answer-field)))
+          (should-not responses)
+          (should (equal "OAuth"
+                         (map-nested-elt state '(:elicitations 40 :answers question_0_custom))))
+          (should-not (map-contains-key
+                       (map-nested-elt state '(:elicitations 40 :answers))
+                       'question_0)))))))
+
+(ert-deftest agent-shell--make-elicitation-custom-command-drops-emptied-text-test ()
+  "Test empty text drops the Other box and leaves the option standing."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 41 (agent-shell-tests--custom-answer-elicitation
+                            (list (cons 'question_0 "JWT")
+                                  (cons 'question_0_custom "OAuth"))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _)))
+                ((symbol-function 'read-string) (lambda (&rest _) "   ")))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (funcall (agent-shell--make-elicitation-custom-command
+                    :state state :request-id 41 :client 'test-client
+                    :field (agent-shell-tests--custom-answer-field)))
+          (should-not responses)
+          (should-not (map-contains-key
+                       (map-nested-elt state '(:elicitations 41 :answers))
+                       'question_0_custom))
+          (should (equal "JWT"
+                         (map-nested-elt state '(:elicitations 41 :answers question_0)))))))))
+
+(ert-deftest agent-shell--make-elicitation-answer-command-drops-the-custom-answer-test ()
+  "Test pressing an option drops the free text it answers instead of."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 42 (agent-shell-tests--custom-answer-elicitation
+                            (list (cons 'question_0_custom "OAuth"))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _))))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (funcall (agent-shell--make-elicitation-answer-command
+                    :state state :request-id 42 :client 'test-client
+                    :field (agent-shell-tests--custom-answer-field)
+                    :value "Session"))
+          (should (equal "Session"
+                         (map-nested-elt state '(:elicitations 42 :answers question_0))))
+          (should-not (map-contains-key
+                       (map-nested-elt state '(:elicitations 42 :answers))
+                       'question_0_custom)))))))
+
+(ert-deftest agent-shell--make-elicitation-custom-command-submits-on-control-return-test ()
+  "Test `C-<return>' on Other answers a one-question form and sends it."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 43 (agent-shell-tests--custom-answer-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'read-string) (lambda (&rest _) "OAuth")))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (funcall (agent-shell--make-elicitation-custom-command
+                    :state state :request-id 43 :client 'test-client
+                    :field (agent-shell-tests--custom-answer-field)
+                    :submit t))
+          (should (equal 1 (length responses)))
+          (should (equal "accept" (map-nested-elt (car responses) '(:result action))))
+          (should (equal "OAuth"
+                         (map-nested-elt (car responses)
+                                         '(:result content question_0_custom)))))))))
+
+(ert-deftest agent-shell--make-elicitation-custom-command-holds-form-on-empty-text-test ()
+  "Test `C-<return>' on an emptied Other box re-renders instead of sending.
+
+The chord must never send a form the prompt just emptied."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (rendered 0)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 44 (agent-shell-tests--custom-answer-elicitation))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
+                ((symbol-function 'agent-shell--render-elicitation)
+                 (lambda (&rest _) (setq rendered (1+ rendered))))
+                ((symbol-function 'read-string) (lambda (&rest _) "")))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (funcall (agent-shell--make-elicitation-custom-command
+                    :state state :request-id 44 :client 'test-client
+                    :field (agent-shell-tests--custom-answer-field)
+                    :submit t))
+          (should-not responses)
+          (should (equal 1 rendered)))))))
+
+(ert-deftest agent-shell--submit-elicitation-sends-the-custom-answer-test ()
+  "Test free text reaches the agent under the key the bridge reads.
+
+The agent prefers a non-empty `question_0_custom' over `question_0'."
+  (with-temp-buffer
+    (let* ((responses nil)
+           (state (agent-shell-tests--elicitation-state (current-buffer)))
+           (agent-shell--state state))
+      (setf (map-elt state :elicitations)
+            (list (cons 45 (agent-shell-tests--custom-answer-elicitation
+                            (list (cons 'question_0_custom "OAuth"))))))
+      (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state)))
+        (agent-shell-tests--with-elicitation-stubs responses
+          (agent-shell--submit-elicitation
+           :state state :request-id 45 :client 'test-client)
+          (should (equal "OAuth"
+                         (map-nested-elt (car responses)
+                                         '(:result content question_0_custom)))))))))
+
+(ert-deftest agent-shell--make-elicitation-text-renders-an-other-button-test ()
+  "Test a question offering free text renders an Other button."
+  (with-temp-buffer
+    (should (string-search
+             (format "[ %s Other (o) ]" agent-shell-elicitation-unselected-icon)
+             (substring-no-properties
+              (agent-shell-tests--elicitation-text
+               (agent-shell-tests--custom-answer-elicitation)))))))
+
+(ert-deftest agent-shell--make-elicitation-text-shows-the-typed-text-test ()
+  "Test the Other button carries the answer, so it reads before Submit."
+  (with-temp-buffer
+    (should (string-search
+             (format "[ %s Other: OAuth (o) ]" agent-shell-elicitation-selected-icon)
+             (substring-no-properties
+              (agent-shell-tests--elicitation-text
+               (agent-shell-tests--custom-answer-elicitation
+                (list (cons 'question_0_custom "OAuth")))))))))
+
+(ert-deftest agent-shell--make-elicitation-text-truncates-long-typed-text-test ()
+  "Test a long answer does not stretch the button row across the window."
+  (with-temp-buffer
+    (let ((text (substring-no-properties
+                 (agent-shell-tests--elicitation-text
+                  (agent-shell-tests--custom-answer-elicitation
+                   (list (cons 'question_0_custom (make-string 80 ?x))))))))
+      (should (string-search (format "Other: %s" (make-string 25 ?x)) text))
+      (should-not (string-search (make-string 40 ?x) text)))))
+
+(ert-deftest agent-shell--make-elicitation-text-binds-the-other-hotkey-test ()
+  "Test `o' reaches the Other box from anywhere in its question."
+  (with-temp-buffer
+    (let ((text (agent-shell-tests--elicitation-text
+                 (agent-shell-tests--custom-answer-elicitation))))
+      (should (agent-shell-tests--elicitation-option-command text "JWT" "o"))
+      (should (agent-shell-tests--elicitation-option-command text "Other" "o")))))
+
+(ert-deftest agent-shell--make-elicitation-text-omits-an-absent-other-button-test ()
+  "Test a question the schema gives no free-text box renders no Other button."
+  (with-temp-buffer
+    (should-not (string-search
+                 "(o) ]"
+                 (substring-no-properties
+                  (agent-shell-tests--elicitation-text
+                   (agent-shell-tests--one-question-elicitation)))))))
 
 ;;; Tests for agent-shell--activity-group-id
 
