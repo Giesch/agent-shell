@@ -9613,11 +9613,16 @@ For example:
 
        Which auth approach?
 
-       [ ● JWT (1) ] [ ○ Session (2) ] [ ○ Other (o) ]
+       [ ● JWT (1) ]
+       [ ○ Session (2) ]
+       [ ○ Other (o) ]
 
        Which areas should the tests cover?
 
-       [ ✓ Parsing (1) ] [ □ Rendering (2) ] [ ✓ Errors (3) ] [ □ Other (o) ]
+       [ ✓ Parsing (1) ]
+       [ □ Rendering (2) ]
+       [ ✓ Errors (3) ]
+       [ □ Other (o) ]
 
        [ Submit (c) ] [ Skip (s) ]
 
@@ -9775,7 +9780,7 @@ For example:
                                        :answer custom-answer
                                        :completes completes
                                        :keymap field-keymap))))
-                             " "))))
+                             "\n    "))))
                 fields)))
     (format "╭─
 

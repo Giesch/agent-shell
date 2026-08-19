@@ -4747,6 +4747,17 @@ explicit send."
               (agent-shell-tests--elicitation-text
                (agent-shell-tests--one-question-elicitation)))))))
 
+(ert-deftest agent-shell--make-elicitation-text-stacks-options-test ()
+  "Test a question's options render one per line, while Submit and Skip share a row."
+  (with-temp-buffer
+    (let ((text (substring-no-properties
+                 (agent-shell-tests--elicitation-text
+                  (agent-shell-tests--two-question-elicitation))))
+          (unchecked agent-shell-elicitation-unselected-icon))
+      (should (string-search (format "JWT (1) ]\n    [ %s Session" unchecked) text))
+      (should (string-search (format "Postgres (1) ]\n    [ %s SQLite" unchecked) text))
+      (should (string-search "[ Submit (c) ] [ Skip (s) ]" text)))))
+
 (ert-deftest agent-shell--make-elicitation-text-scopes-digits-per-question-test ()
   "Test a question's digit hotkeys answer that question.
 
