@@ -6794,6 +6794,31 @@ move the binding to a different option."
     (should (equal "y" (map-elt (nth 0 actions) :char)))
     (should-not (map-elt (nth 1 actions) :char))))
 
+(ert-deftest agent-shell--make-tool-call-permission-text-stacks-options-test ()
+  "Test permission options render one per line."
+  (with-temp-buffer
+    (let* ((actions (agent-shell--make-permission-actions
+                     '(((kind . "allow_once")
+                        (name . "Allow")
+                        (optionId . "allow"))
+                       ((kind . "reject_once")
+                        (name . "Deny")
+                        (optionId . "reject"))
+                       ((kind . "allow_always")
+                        (name . "Always Allow")
+                        (optionId . "allow-always")))))
+           (text (substring-no-properties
+                  (agent-shell--make-tool-call-permission-text
+                   :tool-call `((:title . "Add more cowbell")
+                                (:kind . "other")
+                                (:permission-request-id . 1)
+                                (:permission-actions . ,actions))
+                   :tool-call-id "toolu_1"
+                   :client 'test-client
+                   :state `((:buffer . ,(current-buffer)))))))
+      (should (string-search "Allow (y) ]\n    [ Deny" text))
+      (should (string-search "]\n    [ Always Allow (!) ]" text)))))
+
 (ert-deftest agent-shell--render-markdown-runs-external-renderers-by-default ()
   "Render functions see message bodies, the default for every call site."
   (let ((calls 0))

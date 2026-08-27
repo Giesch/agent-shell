@@ -8752,7 +8752,10 @@ For example:
 
        Add more cowbell
 
-       [ View (v) ] [ Allow (y) ] [ Reject (n) ] [ Always Allow (!) ]
+       [ View (v) ]
+       [ Allow (y) ]
+       [ Reject (n) ]
+       [ Always Allow (!) ]
 
 
    ╰─"
@@ -8830,7 +8833,7 @@ For example:
                  'font-lock-face 'agent-shell-input)
               "")
             (if diff-button
-                (concat diff-button " ")
+                (concat diff-button "\n    ")
               "")
             (mapconcat (lambda (action)
                          (agent-shell--make-permission-button
@@ -8857,7 +8860,7 @@ For example:
                           :option (map-elt action :option)
                           :navigatable t))
                        actions
-                       " "))))
+                       "\n    "))))
 
 (cl-defun agent-shell--send-permission-response (&key client request-id option-id cancelled state tool-call-id message-text)
   "Send a response to a permission request and clean up related dialog UI.
