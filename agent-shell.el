@@ -117,6 +117,16 @@ You may use \"􀇾\" as an SF Symbol on macOS."
   :type 'string
   :group 'agent-shell)
 
+(defcustom agent-shell-permission-option-chars nil
+  "Alist mapping an ACP permission optionId to a key string.
+
+A match overrides the kind-based default key for that option.
+For example, bind \"a\" to Claude Code's exit-plan-mode auto option:
+
+  \\='((\"auto\" . \"a\"))"
+  :type '(alist :key-type string :value-type string)
+  :group 'agent-shell)
+
 (defcustom agent-shell-elicitation-icon "⁇"
   "Icon displayed when an agent asks the user a question."
   :type 'string
@@ -9113,6 +9123,9 @@ ACP-OPTION should be a PermissionOption per ACP spec:
 ACP-SEEN-KINDS is a list of kinds already processed.  If kind is in
 ACP-SEEN-KINDS, omit the keybinding to avoid duplicates.
 
+An optionId match in `agent-shell-permission-option-chars' overrides
+the kind-based keybinding.
+
 Returns an alist of the form:
 
   ((:label . \"Allow (y)\")
@@ -9129,8 +9142,10 @@ Returns nil if the ACP-OPTION kind is not recognized."
                                                                                  agent-shell-mode-map t)))
                                            "n"))))
          (kind (map-elt acp-option 'kind))
-         (char (unless (member kind acp-seen-kinds)
-                 (map-elt char-map kind)))
+         (char (or (map-elt agent-shell-permission-option-chars
+                            (map-elt acp-option 'optionId))
+                   (unless (member kind acp-seen-kinds)
+                     (map-elt char-map kind))))
          (name (map-elt acp-option 'name)))
     (when (map-elt char-map kind)
       (map-into `((:label . ,(if char (format "%s (%s)" name char) name))

@@ -6794,6 +6794,28 @@ move the binding to a different option."
     (should (equal "y" (map-elt (nth 0 actions) :char)))
     (should-not (map-elt (nth 1 actions) :char))))
 
+(ert-deftest agent-shell--make-permission-action-option-id-char-test ()
+  "Test `agent-shell-permission-option-chars' overrides the kind-based key."
+  (let* ((agent-shell-permission-option-chars '(("auto" . "a")))
+         (actions (agent-shell--make-permission-actions
+                   '(((kind . "allow_always")
+                      (name . "Yes, and use \"auto\" mode")
+                      (optionId . "auto"))
+                     ((kind . "allow_always")
+                      (name . "Yes, and auto-accept edits")
+                      (optionId . "acceptEdits"))
+                     ((kind . "allow_once")
+                      (name . "Yes, and manually approve edits")
+                      (optionId . "default"))
+                     ((kind . "reject_once")
+                      (name . "No, keep planning")
+                      (optionId . "plan")))))
+         (auto (seq-find (lambda (action)
+                           (equal (map-elt action :option-id) "auto"))
+                         actions)))
+    (should (equal "a" (map-elt auto :char)))
+    (should (equal "Yes, and use \"auto\" mode (a)" (map-elt auto :label)))))
+
 (ert-deftest agent-shell--make-tool-call-permission-text-stacks-options-test ()
   "Test permission options render one per line."
   (with-temp-buffer
