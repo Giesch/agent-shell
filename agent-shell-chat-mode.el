@@ -104,6 +104,11 @@ to the background); `:box' t adds a border in the foreground color."
 (defvar-local agent-shell-chat--relabel-timer nil
   "Pending coalesced relabel timer for this buffer, or nil.")
 
+(defvar comint-last-prompt)
+
+(defvar-local agent-shell-chat--last-prompt-end nil
+  "End position of `comint-last-prompt' at the last scheduled relabel, or nil.")
+
 ;;; Labels
 
 (defun agent-shell-chat--label (text face)
@@ -427,12 +432,27 @@ newline would merge the input line into the response for line motion
              'agent-shell-chat-agent mbeg end start end
              (list (cons 'before-string before) (cons 'display "")))))))))
 
+(defun agent-shell-chat--delete-orphan-me-overlays ()
+  "Delete every `Me' overlay that no longer covers a prompt run.
+shell-maker strips the prompt face from the previous prompt when it
+prints a new one (an empty submission, an interrupt, an echo), so the
+overlay left on that text would keep showing a live label."
+  (let ((runs (agent-shell-chat--prompt-runs)))
+    (dolist (overlay (overlays-in (point-min) (point-max)))
+      (when (and (eq (overlay-get overlay 'category) 'agent-shell-chat-me)
+                 (not (seq-some (lambda (run)
+                                  (and (<= (overlay-start overlay) (car run))
+                                       (< (car run) (overlay-end overlay))))
+                                runs)))
+        (delete-overlay overlay)))))
+
 (defun agent-shell-chat--relabel ()
   "Apply the `Me' and agent labels to the current buffer (idempotent).
 Scans the whole buffer; cheap in practice since it walks property
 changes and skips already-labeled runs, but could be scoped to the
 active turn if it ever shows on very long conversations."
   (agent-shell-chat--label-prompts)
+  (agent-shell-chat--delete-orphan-me-overlays)
   (agent-shell-chat--label-responses))
 
 (defun agent-shell-chat--relabel-all ()
@@ -463,6 +483,25 @@ and from `shell-maker-finish-output-hook' (which covers `clear')."
              (not agent-shell-chat--relabel-timer))
     (setq agent-shell-chat--relabel-timer
           (run-at-time 0 nil #'agent-shell-chat--relabel-buffer (current-buffer)))))
+
+(defun agent-shell-chat--after-output-filter (process &rest _)
+  "Schedule a relabel in PROCESS's buffer when the prompt has been reprinted.
+Runs after `shell-maker--output-filter'.  Streamed output leaves
+`comint-last-prompt' in place, so only a new prompt schedules a relabel.
+Covers the reprints that fire no `agent-shell' event and no
+`shell-maker-finish-output-hook': an empty submission, an interrupt and
+`shell-maker-echo'."
+  (when-let* ((buffer (process-buffer process))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (when-let* ((agent-shell-chat--labeled)
+                  (prompt-end (and comint-last-prompt
+                                   (marker-position (cdr comint-last-prompt))))
+                  ((not (eql prompt-end agent-shell-chat--last-prompt-end))))
+        (setq agent-shell-chat--last-prompt-end prompt-end)
+        (agent-shell-chat--schedule-relabel)))))
+
+(advice-add 'shell-maker--output-filter :after #'agent-shell-chat--after-output-filter)
 
 (defun agent-shell-chat--enable ()
   "Turn on chat labels in the current buffer and keep them in sync.
@@ -496,6 +535,7 @@ too."
   (remove-overlays (point-min) (point-max) 'category 'agent-shell-chat-agent)
   (kill-local-variable 'agent-shell-chat--subscription)
   (kill-local-variable 'agent-shell-chat--relabel-timer)
+  (kill-local-variable 'agent-shell-chat--last-prompt-end)
   (kill-local-variable 'agent-shell-chat--labeled))
 
 ;;; Mode

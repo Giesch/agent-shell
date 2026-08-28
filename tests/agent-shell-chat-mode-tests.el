@@ -1,6 +1,7 @@
 ;;; agent-shell-chat-mode-tests.el --- Tests for agent-shell-chat-mode -*- lexical-binding: t; -*-
 
 (require 'ert)
+(require 'cl-lib)
 (require 'agent-shell-chat-mode)
 
 ;;; Code:
@@ -374,6 +375,45 @@ The overlay starts past the `:extend' background and drops its `line-prefix'."
     (let ((runs (agent-shell-chat--prompt-runs)))
       (should (= 2 (length runs)))
       (should (< (cdr (nth 0 runs)) (car (nth 1 runs)))))))
+
+(ert-deftest agent-shell-chat-unfaced-prompt-loses-label-test ()
+  "A prompt that loses its face (shell-maker reprinted it) loses its label.
+Only the reprinted prompt is labeled, as the live one."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel)
+      (should (= 1 (length (agent-shell-chat-mode-tests--me-overlays))))
+      (remove-text-properties (point-min) (point-max) '(font-lock-face nil))
+      (insert "\n")
+      (agent-shell-chat-mode-tests--prompt "Claude> ")
+      (agent-shell-chat--relabel))
+    (let ((me (agent-shell-chat-mode-tests--me-overlays)))
+      (should (= 1 (length me)))
+      (should (= (overlay-end (car me)) (point-max)))
+      (should (string-match-p "❯" (overlay-get (car me) 'before-string))))))
+
+(ert-deftest agent-shell-chat-after-output-filter-schedules-relabel-test ()
+  "A moved `comint-last-prompt' schedules one relabel; an unmoved one none."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (setq-local comint-last-prompt (cons (copy-marker (point-min))
+                                         (copy-marker (point-max))))
+    (let ((buffer (current-buffer)))
+      (cl-letf (((symbol-function 'process-buffer) (lambda (_) buffer)))
+        (agent-shell-chat--after-output-filter 'fake-process "")
+        (should (timerp agent-shell-chat--relabel-timer))
+        (cancel-timer agent-shell-chat--relabel-timer)
+        (setq agent-shell-chat--relabel-timer nil)
+        (agent-shell-chat--after-output-filter 'fake-process "")
+        (should-not agent-shell-chat--relabel-timer)
+        (insert "\n")
+        (agent-shell-chat-mode-tests--prompt "Claude> ")
+        (setq-local comint-last-prompt (cons (copy-marker (- (point-max) 8))
+                                             (copy-marker (point-max))))
+        (agent-shell-chat--after-output-filter 'fake-process "")
+        (should (timerp agent-shell-chat--relabel-timer))
+        (cancel-timer agent-shell-chat--relabel-timer)))))
 
 (provide 'agent-shell-chat-mode-tests)
 ;;; agent-shell-chat-mode-tests.el ends here
