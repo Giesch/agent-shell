@@ -27,5 +27,32 @@
       (should (equal (map-elt bounds :start) 3))
       (should (equal (map-elt bounds :end) 7)))))
 
+(ert-deftest agent-shell-completion-setup-queued-prompt-test ()
+  "The queued-prompt hook enables completion for the event's shell.
+Reached through `agent-shell-prompt-queue-setup-minibuffer-functions', so
+the queue does not have to know completion exists."
+  (let ((shell (generate-new-buffer " *agent-shell-completion-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer shell (agent-shell-completion-mode 1))
+          (with-temp-buffer
+            (agent-shell-completion--setup-queued-prompt
+             `((:shell-buffer . ,shell)))
+            (should (eq shell agent-shell-completion--shell-buffer))
+            (should (memq #'agent-shell--file-completion-at-point
+                          completion-at-point-functions))))
+      (kill-buffer shell))))
+
+(ert-deftest agent-shell-completion-setup-queued-prompt-without-mode-test ()
+  "A shell without completion enabled leaves the minibuffer alone."
+  (let ((shell (generate-new-buffer " *agent-shell-completion-test*")))
+    (unwind-protect
+        (with-temp-buffer
+          (agent-shell-completion--setup-queued-prompt
+           `((:shell-buffer . ,shell)))
+          (should-not (memq #'agent-shell--file-completion-at-point
+                            completion-at-point-functions)))
+      (kill-buffer shell))))
+
 (provide 'agent-shell-completion-tests)
 ;;; agent-shell-completion-tests.el ends here

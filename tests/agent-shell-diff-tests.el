@@ -185,6 +185,41 @@ fall back to searching the new-side text.  Mirrors the real Claude Code
             (when (find-buffer-visiting file) (kill-buffer (find-buffer-visiting file)))))
       (delete-file file))))
 
+(ert-deftest agent-shell-diff-open-file-drops-stale-region-test ()
+  "Test that jumping into a file drops a region left active in it.
+
+A range reference elsewhere (`file:2-4', say) leaves its lines
+selected, and this jump moves point out from under that selection, so
+what it would otherwise span afterwards is neither the range nor the
+change."
+  (let ((file (make-temp-file "agent-shell-jump" nil ".txt"
+                              "alpha\nbeta\ngamma\ndelta\n")))
+    (unwind-protect
+        (let ((buf (agent-shell-diff
+                    :diffs (list (list (cons :old "gamma")
+                                       (cons :new "gamma CHANGED")
+                                       (cons :file file))))))
+          (unwind-protect
+              (progn
+                (with-current-buffer (find-file-noselect file)
+                  (goto-char (point-min))
+                  (push-mark (line-end-position 2) t t)
+                  ;; `mark-active' rather than `region-active-p': the latter
+                  ;; is nil whenever `transient-mark-mode' is off (as under
+                  ;; batch), passing whether or not the mark was cleared.
+                  (should mark-active))
+                (with-current-buffer buf
+                  (goto-char (point-min))
+                  (search-forward "-gamma")
+                  (beginning-of-line)
+                  (agent-shell-diff-open-file))
+                (with-current-buffer (find-buffer-visiting file)
+                  (should (equal (line-number-at-pos) 3))
+                  (should-not mark-active)))
+            (when (buffer-live-p buf) (kill-buffer buf))
+            (when (find-buffer-visiting file) (kill-buffer (find-buffer-visiting file)))))
+      (delete-file file))))
+
 (ert-deftest agent-shell-diff-open-file-disambiguates-with-hint-test ()
   "Test that the ACP `locations' line picks between duplicate matches.
 

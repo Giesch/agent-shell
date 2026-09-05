@@ -290,6 +290,38 @@ streaming **not bold**" nil)))))
                    ("docs" (agent-shell-markdown-link))
                    (" please" nil)))))
 
+(ert-deftest agent-shell-markdown-hint-stops-at-end-of-what-it-describes ()
+  "A hint answers on its own text and not on the character after it.
+
+`cursor-sensor' reads `cursor-sensor-functions' with
+`get-pos-property' before falling back to `get-char-property', and
+`get-pos-property' reports what text inserted at a position would
+inherit rather than what sits there.  Unless the span is
+rear-nonsticky the hint still answers one position past its end, so a
+link's \"Press RET to open in browser\" shows while point sits on the
+space after the link."
+  (with-temp-buffer
+    (insert "see [wool.com](https://wool.com/x) ok\n\n"
+            "| A | L |\n|---|---|\n| x | [j.com](https://j.com/y) |\n\n"
+            "```elisp\n(hi)\n```\n")
+    (agent-shell-markdown-replace-markup :force t)
+    (let ((pos (point-min))
+          (spans 0))
+      (while (setq pos (text-property-not-all
+                        pos (point-max) 'cursor-sensor-functions nil))
+        (let ((end (or (next-single-property-change pos 'cursor-sensor-functions)
+                       (point-max))))
+          (setq spans (1+ spans))
+          ;; Reaches its own first character.
+          (should (or (get-pos-property pos 'cursor-sensor-functions)
+                      (get-char-property pos 'cursor-sensor-functions)))
+          ;; ...and doesn't leak past its last.  Checked with
+          ;; `get-pos-property' alone: `get-char-property' there would
+          ;; report whatever span comes next, which is legitimate.
+          (should-not (get-pos-property end 'cursor-sensor-functions))
+          (setq pos end)))
+      (should (> spans 0)))))
+
 (ert-deftest agent-shell-markdown-convert-link-with-balanced-parens ()
   "A bare destination may carry balanced parens, as Wikipedia URLs do.
 
@@ -898,6 +930,267 @@ it is still picked up by the bare-URL linkifier."
                    (buffer-substring-no-properties (point-min) (point-max))))
     (should (equal "https://target.com"
                    (agent-shell-markdown-link-url-at-point (point-min))))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference ()
+  ;; Agents cite their sources as `path:line', which is plain text until
+  ;; this pass makes it a link: faced, carrying its target for
+  ;; copy/export, and a stop for item navigation.
+  (let ((file (make-temp-file "agent-shell-ref" nil ".el" "one\ntwo\nthree\n")))
+    (unwind-protect
+        (with-temp-buffer
+          (insert (format "see %s:2 now." file))
+          (agent-shell-markdown-replace-markup)
+          (should (equal (format "see %s:2 now." file)
+                         (buffer-substring-no-properties (point-min) (point-max))))
+          ;; The trailing period is prose, not part of the reference.
+          (should (equal (format "%s:2" file)
+                         (agent-shell-markdown-link-url-at-point 5)))
+          (should (equal 'agent-shell-markdown-link (get-text-property 5 'face)))
+          (should (get-text-property 5 'keymap))
+          (should (get-text-property 5 'cursor-sensor-functions))
+          (goto-char (point-min))
+          (should (= 5 (agent-shell-markdown--next-visible-link))))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference-resolves-relative-path ()
+  "Test a citation naming a path relative to `default-directory' links.
+
+Agents cite relative paths (`src/main.rs:120'), which reach a file only
+through the shell's own directory, so the absolute paths the other
+reference tests use would not catch a resolution gone wrong."
+  (let* ((directory (make-temp-file "agent-shell-refs" t))
+         (default-directory (file-name-as-directory directory)))
+    (unwind-protect
+        (progn
+          (with-temp-file (expand-file-name "foo.el") (insert "one\ntwo\nthree\n"))
+          (with-temp-buffer
+            (insert "see `foo.el:2` and foo.el:3 here")
+            (agent-shell-markdown-replace-markup :complete t)
+            (goto-char (point-min))
+            (search-forward "foo.el:2")
+            (should (equal "foo.el:2"
+                           (agent-shell-markdown-link-url-at-point
+                            (match-beginning 0))))
+            (search-forward "foo.el:3")
+            (should (equal "foo.el:3"
+                           (agent-shell-markdown-link-url-at-point
+                            (match-beginning 0))))))
+      (delete-directory directory t))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference-forms ()
+  ;; The forms agents write: a line, a range, a line and column, and
+  ;; GitHub's anchor.
+  (let ((file (make-temp-file "agent-shell-ref" nil ".el" "one\ntwo\nthree\n")))
+    (unwind-protect
+        (dolist (suffix '(":2" ":1-3" ":2:5" "#L2"))
+          (with-temp-buffer
+            (insert (format "see %s%s here" file suffix))
+            (agent-shell-markdown-replace-markup)
+            (should (equal (concat file suffix)
+                           (agent-shell-markdown-link-url-at-point 5)))))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference-in-inline-code ()
+  ;; Agents wrap nearly every citation in backticks, that being how a path
+  ;; reads, so one in a code span is still a citation.  The span keeps its
+  ;; own face and the link composes on top.
+  (let ((file (make-temp-file "agent-shell-ref" nil ".el" "one\ntwo\nthree\n")))
+    (unwind-protect
+        (with-temp-buffer
+          (insert (format "code `%s:2` here" file))
+          (agent-shell-markdown-replace-markup)
+          (should (equal (format "code %s:2 here" file)
+                         (buffer-substring-no-properties (point-min) (point-max))))
+          (should (equal (format "%s:2" file)
+                         (agent-shell-markdown-link-url-at-point 6)))
+          (should (equal '(agent-shell-markdown-link agent-shell-markdown-inline-code)
+                         (get-text-property 6 'face))))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference-skips-fenced-block ()
+  ;; A path inside a fenced block is sample content or command output
+  ;; rather than a citation.
+  (let ((file (make-temp-file "agent-shell-ref" nil ".el" "one\ntwo\nthree\n")))
+    (unwind-protect
+        (with-temp-buffer
+          (insert (format "```\n%s:2\n```\n" file))
+          (agent-shell-markdown-replace-markup)
+          (goto-char (point-min))
+          (should (null (text-property-search-forward 'agent-shell-markdown-url))))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference-skips-frozen ()
+  ;; Inline code is the only place the frozen tag is excused, and that is
+  ;; read off the inline ranges rather than the tag: a region an external
+  ;; renderer froze is still left alone.
+  (let ((file (make-temp-file "agent-shell-ref" nil ".el" "one\ntwo\nthree\n")))
+    (unwind-protect
+        (let ((agent-shell-markdown-render-functions
+               (list (lambda (_context)
+                       (goto-char (point-min))
+                       (when (search-forward (format "%s:2" file) nil t)
+                         (add-text-properties (match-beginning 0) (match-end 0)
+                                              '(agent-shell-markdown-frozen t)))
+                       nil))))
+          (with-temp-buffer
+            (insert (format "see %s:2 here" file))
+            (agent-shell-markdown-replace-markup)
+            (goto-char (point-min))
+            (should (null (text-property-search-forward 'agent-shell-markdown-url)))))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference-frozen-excused-only-in-code ()
+  "Test that the frozen tag is excused for inline code and nothing else.
+
+The pass drives `agent-shell-markdown--linkify-url' directly here, with
+the ranges it would be handed mid-render, since by the time frozen text
+reaches it through a whole render it has usually been screened out as an
+avoid-range first -- which would pass whether or not the tag still spoke
+for anything."
+  (let ((file (make-temp-file "agent-shell-ref" nil ".el" "one\ntwo\nthree\n")))
+    (unwind-protect
+        (let ((reference (format "%s:2" file)))
+          ;; Frozen, and not named as inline code: the tag still speaks.
+          (with-temp-buffer
+            (insert (format "see %s here" reference))
+            (put-text-property 5 (+ 5 (length reference))
+                               'agent-shell-markdown-frozen t)
+            (agent-shell-markdown--linkify-file-references
+             :avoid-ranges (agent-shell-markdown-sort-ranges nil)
+             :inline-ranges (agent-shell-markdown-sort-ranges nil))
+            (should (null (agent-shell-markdown-link-url-at-point 5))))
+          ;; Same tag on the same text, named as an inline span: linked.
+          (with-temp-buffer
+            (insert (format "see %s here" reference))
+            (put-text-property 5 (+ 5 (length reference))
+                               'agent-shell-markdown-frozen t)
+            (agent-shell-markdown--linkify-file-references
+             :avoid-ranges (agent-shell-markdown-sort-ranges nil)
+             :inline-ranges (agent-shell-markdown-sort-ranges
+                             (list (cons 5 (+ 5 (length reference))))))
+            (should (equal reference
+                           (agent-shell-markdown-link-url-at-point 5)))))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference-needs-a-file-and-a-line ()
+  ;; What keeps prose from turning into links: the path has to name a
+  ;; file that exists, and the reference has to name a line.  A number
+  ;; running into a word isn't a line either.
+  (let ((file (make-temp-file "agent-shell-ref" nil ".el" "one\ntwo\nthree\n")))
+    (unwind-protect
+        (dolist (text (list "see /does/not/exist.el:2 here"
+                            "meeting at 12:30 here"
+                            (format "see %s here" file)
+                            (format "see %s:2xy here" file)))
+          (with-temp-buffer
+            (insert text)
+            (agent-shell-markdown-replace-markup)
+            (goto-char (point-min))
+            (should (null (text-property-search-forward
+                           'agent-shell-markdown-url)))))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference-while-streaming ()
+  ;; A reference arrives a chunk at a time, and `file:1' is a reference
+  ;; to line 1 in its own right.  Each chunk has to redo it, or it stays
+  ;; pointing at a line that is real but not the cited one.
+  (let ((file (make-temp-file "agent-shell-ref" nil ".el"
+                              "one\ntwo\nthree\nfour\nfive\n")))
+    (unwind-protect
+        (with-temp-buffer
+          (insert (format "see %s:1" file))
+          (agent-shell-markdown-replace-markup)
+          (should (equal (format "%s:1" file)
+                         (agent-shell-markdown-link-url-at-point 5)))
+          (insert "-")
+          (agent-shell-markdown-replace-markup)
+          (insert "4 done")
+          (agent-shell-markdown-replace-markup)
+          (should (equal (format "%s:1-4" file)
+                         (agent-shell-markdown-link-url-at-point 5)))
+          ;; Redone, not composed with itself.
+          (should (equal 'agent-shell-markdown-link (get-text-property 5 'face))))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-linkify-bare-url-while-streaming ()
+  ;; Same for a URL: a truncated one is a URL too, so what was linked
+  ;; while the rest streamed in has to grow with it rather than stay a
+  ;; link to the prefix.
+  (with-temp-buffer
+    (insert "see https://example.com/fo")
+    (agent-shell-markdown-replace-markup)
+    (should (equal "https://example.com/fo"
+                   (agent-shell-markdown-link-url-at-point 5)))
+    (insert "o/ba")
+    (agent-shell-markdown-replace-markup)
+    (insert "r now")
+    (agent-shell-markdown-replace-markup)
+    (should (equal "https://example.com/foo/bar"
+                   (agent-shell-markdown-link-url-at-point 5)))
+    ;; The whole URL is faced, and faced once.
+    (should (equal 'agent-shell-markdown-link (get-text-property 5 'face)))
+    (should (equal 'agent-shell-markdown-link (get-text-property 30 'face)))
+    ;; One link, so one stop for item navigation.
+    (goto-char (point-min))
+    (should (= 5 (agent-shell-markdown--next-visible-link)))
+    (goto-char 5)
+    (should (null (agent-shell-markdown--next-visible-link)))))
+
+(ert-deftest agent-shell-markdown-linkify-keeps-composed-faces ()
+  ;; A link inside bold keeps both faces, the link face going on once.
+  (with-temp-buffer
+    (insert "**see https://example.com/fo**")
+    (agent-shell-markdown-replace-markup)
+    (goto-char (point-max))
+    (insert "o now")
+    (agent-shell-markdown-replace-markup)
+    (should (equal "https://example.com/foo"
+                   (agent-shell-markdown-link-url-at-point 5)))
+    (should (equal '(agent-shell-markdown-link agent-shell-markdown-bold)
+                   (get-text-property 5 'face)))))
+
+(ert-deftest agent-shell-markdown-linkify-file-reference-leaves-urls-alone ()
+  ;; A URL's port is not a line number, and the URL pass has already
+  ;; claimed the text by the time references are looked for.
+  (with-temp-buffer
+    (insert "see https://example.com:8080/x now")
+    (agent-shell-markdown-replace-markup)
+    (should (equal "https://example.com:8080/x"
+                   (agent-shell-markdown-link-url-at-point 5)))))
+
+(ert-deftest agent-shell-markdown--open-local-link-lands-on-column-test ()
+  "Test `agent-shell-markdown--open-local-link' reaches a cited column.
+
+The `file:line:column' agents cite has to survive parsing and opening,
+not just linkify, so this walks the whole way in."
+  (let ((file (make-temp-file "agent-shell-column" nil ".el" "one\ntwo\nthree\n")))
+    (unwind-protect
+        (save-window-excursion
+          (should (agent-shell-markdown--open-local-link (concat file ":3:4")))
+          (should (equal 3 (line-number-at-pos (point))))
+          (should (equal 3 (current-column))))
+      (when (get-file-buffer file)
+        (kill-buffer (get-file-buffer file)))
+      (delete-file file))))
+
+(ert-deftest agent-shell-markdown-visit-file-with-column-test ()
+  "Test `agent-shell-markdown-visit-file' honours a column.
+
+Columns are counted from 1, as the agents citing them do, so column 3
+lands on `current-column' 2.  A column past the end of the line settles
+for its end."
+  (let ((file (make-temp-file "agent-shell-column" nil ".el" "one\ntwo\nthree\n")))
+    (unwind-protect
+        (save-window-excursion
+          (agent-shell-markdown-visit-file :file file :line-start 3 :column 3)
+          (should (equal 3 (line-number-at-pos (point))))
+          (should (equal 2 (current-column)))
+          (agent-shell-markdown-visit-file :file file :line-start 1 :column 99)
+          (should (equal 1 (line-number-at-pos (point))))
+          (should (equal 3 (current-column))))
+      (when (get-file-buffer file)
+        (kill-buffer (get-file-buffer file)))
+      (delete-file file))))
 
 (ert-deftest agent-shell-markdown-remote-image-fallback-is-a-link ()
   ;; A remote image that can't be shown inline renders as a link opening
@@ -2341,52 +2634,22 @@ after" nil)))))
     (should alice-pos)
     (should (eq 'agent-shell-markdown-bold (get-text-property alice-pos 'face s)))))
 
-(ert-deftest agent-shell-markdown-table-hints-cell-navigation ()
-  ;; A rendered table gives no sign its cells are navigable, so entering
-  ;; it echoes the keys `agent-shell-markdown-table-map' binds.  The hint
-  ;; is derived, so rebinding the map re-words it.
-  (let ((agent-shell-markdown-table-map (copy-keymap agent-shell-markdown-table-map))
-        (echoed nil))
-    (cl-letf (((symbol-function 'message)
-               (lambda (format-string &rest args)
-                 (setq echoed (apply #'format format-string args)))))
-      (let ((rendered (agent-shell-markdown-convert "| A | B |
-|---|---|
-| 1 | 2 |")))
-        (should (eq agent-shell-markdown-table-map
-                    (get-text-property 0 'keymap rendered)))
-        (funcall (seq-first (get-text-property 0 'cursor-sensor-functions rendered))
-                 nil nil 'entered)
-        (should (equal "Press TAB/<backtab> to move between cells" echoed)))
-      (define-key agent-shell-markdown-table-map (kbd "TAB") nil t)
-      (define-key agent-shell-markdown-table-map (kbd "<backtab>") nil t)
-      (define-key agent-shell-markdown-table-map (kbd "C-c C-n")
-                  #'agent-shell-markdown-table-next-cell)
-      (setq echoed nil)
-      (funcall (seq-first (get-text-property
-                           0 'cursor-sensor-functions
-                           (agent-shell-markdown-convert "| A | B |
-|---|---|
-| 1 | 2 |")))
-               nil nil 'entered)
-      (should (equal "Press C-c C-n to move between cells" echoed)))))
-
 (ert-deftest agent-shell-markdown-table-leaves-cell-link-keys-alone ()
-  ;; Cells hold whatever the inline passes rendered, links included.  The
-  ;; table's keymap fills in around them rather than over them, so RET
-  ;; still opens a link sitting in a cell (and its own hint survives).
+  ;; Cells hold whatever the inline passes rendered, links included.  A
+  ;; table claims no keys and echoes no hint of its own (item navigation
+  ;; walks its cells like any other item), so a link sitting in a cell
+  ;; keeps both: RET opens it, and entering it says so.
   (let ((rendered (agent-shell-markdown-convert "| A | [docs](https://example.com) |
 |---|---|
 | 1 | 2 |"))
         (echoed nil))
     (let ((link-start (string-match "docs" (substring-no-properties rendered))))
       (should link-start)
-      ;; The border char before the link carries the table's map...
-      (should (eq agent-shell-markdown-table-map
-                  (get-text-property 0 'keymap rendered)))
-      ;; ...while the link keeps its own, opening rather than navigating.
-      (should-not (eq agent-shell-markdown-table-map
-                      (get-text-property link-start 'keymap rendered)))
+      ;; The border char before the link carries neither...
+      (should-not (get-text-property 0 'keymap rendered))
+      (should-not (get-text-property 0 'cursor-sensor-functions rendered))
+      ;; ...while the link keeps its own, opening the URL.
+      (should (get-text-property link-start 'keymap rendered))
       (cl-letf (((symbol-function 'message)
                  (lambda (format-string &rest args)
                    (setq echoed (apply #'format format-string args)))))
@@ -3092,12 +3355,133 @@ after" nil)))))
         ;; The continuation line "longer description" is NOT a cell.
         (should-error (agent-shell-markdown-table-next-cell) :type 'user-error)))))
 
+(ert-deftest agent-shell-markdown-table-entry-position-resolves-from-outside-only ()
+  ;; A table is entered at its first cell, so a position inside one
+  ;; resolves there.  Coming from inside that same table it doesn't:
+  ;; navigation walks its cells and their links one by one.
+  (with-temp-buffer
+    (insert "before
+
+| A | B |
+|---|---|
+| 1 | see [docs](https://example.com) |
+")
+    (agent-shell-markdown-replace-markup)
+    (goto-char (point-min))
+    (should (search-forward "A"))
+    (let ((first-cell (match-beginning 0))
+          (outside (point-min)))
+      (should (search-forward "docs"))
+      (let ((link (match-beginning 0)))
+        (should (eq first-cell
+                    (agent-shell-markdown-table--entry-position
+                     :position link :from outside)))
+        (should (eq link
+                    (agent-shell-markdown-table--entry-position
+                     :position link :from first-cell)))
+        ;; A position outside any table is nobody's entry point.
+        (should (eq outside
+                    (agent-shell-markdown-table--entry-position
+                     :position outside :from link)))))))
+
+(ert-deftest agent-shell-markdown-table-first-cell-returns-to-entry-point ()
+  (with-temp-buffer
+    (insert "| A | B |
+|---|---|
+| 1 | 2 |
+")
+    (agent-shell-markdown-replace-markup)
+    (goto-char (point-min))
+    (should (search-forward "A"))
+    ;; Any position in the table resolves to its first cell.
+    (let ((first-cell (match-beginning 0)))
+      (should (search-forward "2"))
+      (goto-char (match-beginning 0))
+      (should (eq first-cell (agent-shell-markdown-table--first-cell (point)))))
+    ;; Outside a table there's no cell to resolve to.
+    (goto-char (point-max))
+    (should-not (agent-shell-markdown-table--first-cell (point)))))
+
+(ert-deftest agent-shell-markdown-visible-search-finds-nearest-table-cell ()
+  ;; Cell starts are what item navigation searches for to find a table.
+  (with-temp-buffer
+    (insert "before
+
+| A | B |
+|---|---|
+| 1 | 2 |
+
+after
+")
+    (agent-shell-markdown-replace-markup)
+    (goto-char (point-min))
+    ;; Forward from outside, the next cell is the table's first one.
+    (should (eq (save-excursion
+                  (should (search-forward "A"))
+                  (match-beginning 0))
+                (agent-shell-markdown--search-visible
+                 :property 'agent-shell-markdown-table-cell-start)))
+    (goto-char (point-max))
+    ;; Backward from outside, it's the last one (callers resolve it to
+    ;; the first with `agent-shell-markdown-table--first-cell').
+    (should (eq (save-excursion
+                  (goto-char (point-min))
+                  (should (search-forward "2"))
+                  (match-beginning 0))
+                (agent-shell-markdown--search-visible
+                 :property 'agent-shell-markdown-table-cell-start
+                 :backwards t)))))
+
+(ert-deftest agent-shell-markdown-visible-search-skips-hidden-table ()
+  ;; A table inside collapsed text is text nothing shows, so navigation
+  ;; doesn't enter it.
+  (with-temp-buffer
+    (insert "| A | B |
+|---|---|
+| 1 | 2 |
+")
+    (agent-shell-markdown-replace-markup)
+    (put-text-property (point-min) (point-max) 'invisible t)
+    (goto-char (point-min))
+    (should-not (agent-shell-markdown--search-visible
+                 :property 'agent-shell-markdown-table-cell-start))
+    (goto-char (point-max))
+    (should-not (agent-shell-markdown--search-visible
+                 :property 'agent-shell-markdown-table-cell-start
+                 :backwards t))))
+
 (ert-deftest agent-shell-markdown-table-next-cell-errors-outside-table ()
   (with-temp-buffer
     (insert "not a table at all")
     (goto-char (point-min))
     (should-error (agent-shell-markdown-table-next-cell) :type 'user-error)
     (should-error (agent-shell-markdown-table-previous-cell) :type 'user-error)))
+
+(ert-deftest agent-shell-markdown-table-link-keeps-ret-across-rerenders ()
+  "A link in a cell keeps its keymap when later rows stream in.
+
+The table re-renders from its stashed source on each new row, carrying
+the properties at its start position across the delete+insert.  A
+link's `keymap' can sit there, so carrying it would spread that one
+link's map over every cell (see
+`agent-shell-markdown--carry-properties').
+
+Plain cell text keeps no keymap of its own, leaving the buffer's own
+keys to navigate it."
+  (with-temp-buffer
+    (insert "| Bag | Link |\n|---|---|\n| Wool | [wool.com](https://wool.com/x) |\n")
+    (agent-shell-markdown-replace-markup)
+    (goto-char (point-max))
+    (insert "| July | [july.com](https://july.com/y) |\n")
+    (agent-shell-markdown-replace-markup)
+    (dolist (needle '("wool.com" "july.com"))
+      (goto-char (point-min))
+      (should (search-forward needle nil t))
+      (should (lookup-key (get-text-property (match-beginning 0) 'keymap)
+                          (kbd "RET"))))
+    (goto-char (point-min))
+    (should (search-forward "Wool" nil t))
+    (should-not (get-text-property (match-beginning 0) 'keymap))))
 
 (ert-deftest agent-shell-markdown-convert-table-in-fenced-block-untouched ()
   ;; A table inside a fenced block stays untouched (source-block body
@@ -3209,22 +3593,6 @@ A " nil)
     ;; And the newly-streamed bold still rendered normally.
     (should (string-match-p "^hello\nworld\n$"
                             (substring-no-properties (buffer-string))))))
-
-(ert-deftest agent-shell-markdown-yank-strips-properties ()
-  ;; Rendered chars carry a `yank-handler' that strips every text
-  ;; property on paste — display overrides, internal markers, faces,
-  ;; keymaps — so a copy/paste into another buffer gives plain chars,
-  ;; not our implementation cruft.
-  (with-temp-buffer
-    (insert "**bold** and `code`\n")
-    (agent-shell-markdown-replace-markup)
-    (kill-new (buffer-substring (point-min) (point-max))))
-  (with-temp-buffer
-    (yank)
-    (let ((pos (point-min)))
-      (while (< pos (point-max))
-        (should-not (text-properties-at pos))
-        (setq pos (1+ pos))))))
 
 (ert-deftest agent-shell-markdown-convert-blockquote-single-level ()
   ;; `> text\n' keeps the `>' in the buffer (source round-trips) but
@@ -3748,6 +4116,7 @@ leave point somewhere the user can't see rather than fail."
 Text/navigable files open in Emacs; binary files open externally."
   (let ((text (make-temp-file "agent-shell-ol-text" nil ".txt"))
         (binary (make-temp-file "agent-shell-ol-bin" nil ".bin"))
+        (dir (make-temp-file "agent-shell-ol-dir" t))
         (action nil))
     (unwind-protect
         (progn
@@ -3762,6 +4131,12 @@ Text/navigable files open in Emacs; binary files open externally."
                    (lambda (path) (setq action (cons 'in-emacs path)) nil)))
               (should (agent-shell-markdown--open-local-link (concat "file://" text))))
             (should (equal action (cons 'in-emacs text)))
+            ;; Directory -> opened in Emacs (e.g. dired), however the opener displays it.
+            (setq action nil)
+            (let ((agent-shell-markdown-open-file-function
+                   (lambda (path) (setq action (cons 'in-emacs path)) nil)))
+              (should (agent-shell-markdown--open-local-link (concat "file://" dir))))
+            (should (equal action (cons 'in-emacs dir)))
             ;; Binary file -> open externally.
             (setq action nil)
             (should (agent-shell-markdown--open-local-link (concat "file://" binary)))
@@ -3771,7 +4146,8 @@ Text/navigable files open in Emacs; binary files open externally."
             (should (agent-shell-markdown--open-local-link (concat "file://" binary "#L10")))
             (should (equal action (cons 'external binary)))))
       (delete-file text)
-      (delete-file binary))))
+      (delete-file binary)
+      (delete-directory dir))))
 
 (ert-deftest agent-shell-markdown--parse-local-link-lines-test ()
   "Test `agent-shell-markdown--parse-local-link' reads lines and ranges.
@@ -3781,9 +4157,9 @@ plainer `#L10-24' both have to land."
   (let ((file (make-temp-file "agent-shell-lines" nil ".el" "one\ntwo\nthree\nfour\nfive\n")))
     (unwind-protect
         (progn
-          (should (equal (list (cons :line-start nil) (cons :line-end nil))
-                         (seq-drop (agent-shell-markdown--parse-local-link file) 1)))
-          (should (equal (list (cons :line-start 2) (cons :line-end nil))
+          ;; No location named, so nothing beyond the file itself.
+          (should-not (seq-drop (agent-shell-markdown--parse-local-link file) 1))
+          (should (equal (list (cons :line-start 2))
                          (seq-drop (agent-shell-markdown--parse-local-link
                                     (concat file "#L2")) 1)))
           (should (equal (list (cons :line-start 2) (cons :line-end 4))
@@ -3795,6 +4171,10 @@ plainer `#L10-24' both have to land."
           (should (equal (list (cons :line-start 3) (cons :line-end 5))
                          (seq-drop (agent-shell-markdown--parse-local-link
                                     (concat file ":3-5")) 1)))
+          ;; Agents cite a column as readily as a line.
+          (should (equal (list (cons :line-start 3) (cons :column 5))
+                         (seq-drop (agent-shell-markdown--parse-local-link
+                                    (concat file ":3:5")) 1)))
           ;; Garbage after the digits is still rejected outright.
           (should-not (agent-shell-markdown--parse-local-link (concat file "#L2xy"))))
       (delete-file file))))
@@ -3802,7 +4182,9 @@ plainer `#L10-24' both have to land."
 (ert-deftest agent-shell-markdown--open-local-link-selects-range-test ()
   "Test `agent-shell-markdown--open-local-link' selects a linked range.
 
-Without a range it only moves point, leaving the mark alone."
+Without a range it only moves point, and drops a region an earlier
+jump into the same file left active: point having moved out from under
+it, what it now spans is neither jump's."
   (let ((file (make-temp-file "agent-shell-range" nil ".el" "one\ntwo\nthree\nfour\nfive\n")))
     (unwind-protect
         (save-window-excursion
@@ -3810,10 +4192,13 @@ Without a range it only moves point, leaving the mark alone."
           (should (equal 2 (line-number-at-pos (point))))
           (should (equal "two\nthree\nfour"
                          (buffer-substring-no-properties (point) (mark))))
-          (deactivate-mark)
+          ;; `mark-active' rather than `region-active-p': the latter is nil
+          ;; whenever `transient-mark-mode' is off (as under batch), passing
+          ;; whether or not the mark was ever cleared.
+          (should mark-active)
           (should (agent-shell-markdown--open-local-link (concat file "#L3")))
           (should (equal 3 (line-number-at-pos (point))))
-          (should-not (region-active-p)))
+          (should-not mark-active))
       (when (get-file-buffer file)
         (kill-buffer (get-file-buffer file)))
       (delete-file file))))

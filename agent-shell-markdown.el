@@ -41,6 +41,10 @@
 ;;   image       `![alt](url)'            `display' property carries image
 ;;                 (`(<url>)' also OK — angle brackets allow spaces in the url)
 ;;   image path  bare image path on a line  same as `![alt](url)' (no markup)
+;;   file ref    `path:12' cited in text  face `agent-shell-markdown-link',
+;;                                         RET opens the file at that line
+;;                 (bare or in `code' backticks; `path:12-24',
+;;                  `path:12:5' and `path#L12' also OK)
 ;;   divider     `---' / `***' / `___'    rendered as an underlined rule line
 ;;   fenced code ```LANG\nX\n```          body syntax-highlighted via LANG mode
 ;;   tables      `| A | B |' grid rows    rendered with aligned columns,
@@ -201,30 +205,6 @@ When nil, fall back to ASCII pipes and dashes.")
 
 (defvar agent-shell-markdown-table-zebra-stripe t
   "When non-nil, alternate row backgrounds in tables for readability.")
-
-(defvar agent-shell-markdown-table-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "TAB") #'agent-shell-markdown-table-next-cell)
-    (define-key map (kbd "<backtab>") #'agent-shell-markdown-table-previous-cell)
-    map)
-  "Keymap active on a rendered markdown table.
-
-Applied as a `keymap' text property by
-`agent-shell-markdown--render-table', so cell navigation works wherever
-a table renders rather than only where a host wires it up
-\(`agent-shell-next-item' and the viewport's equivalent dispatch to the
-same commands, for the keys they own).
-
-The keys are named in the hint a table echoes on entry (see
-`agent-shell-markdown--table-hint'), so rebinding one re-words the
-hint too:
-
-  (with-eval-after-load \\='agent-shell-markdown
-    (define-key agent-shell-markdown-table-map
-                (kbd \"C-c C-n\") #\\='agent-shell-markdown-table-next-cell))
-
-Rebind with `define-key' rather than `setq': already rendered tables
-hold on to this keymap object.")
 
 (defvar agent-shell-markdown-list-bullets '("•" "◦")
   "Bullet glyphs for unordered lists, cycled by nesting depth.
@@ -449,6 +429,15 @@ body un-fontified."
         ;; After the markup passes, so a URL already consumed as a
         ;; `[title](url)' destination or an image's is not seen again.
         (agent-shell-markdown--linkify-urls :avoid-ranges avoid-ranges)
+        ;; After the URL pass, so a port already claimed as part of
+        ;; `https://host:8080/x' is not read as a line number too.
+        (agent-shell-markdown--linkify-file-references
+         ;; Everything `avoid-ranges' holds but the inline spans, so a
+         ;; citation in backticks is reached while fenced blocks and
+         ;; earlier renders' work stay untouched.
+         :avoid-ranges (agent-shell-markdown-sort-ranges
+                        source-ranges rendered-ranges)
+         :inline-ranges inline-ranges)
         (agent-shell-markdown--style-dividers :avoid-ranges avoid-ranges)
         (agent-shell-markdown--style-blockquotes :avoid-ranges avoid-ranges)
         (agent-shell-markdown--style-lists :avoid-ranges avoid-ranges)
@@ -477,14 +466,6 @@ body un-fontified."
         ;; chunk and would otherwise clear our `face' properties.
         (agent-shell-markdown--mirror-face-to-font-lock-face
          (point-min) (point-max))
-        ;; Tag rendered chars so a yank into another buffer drops the
-        ;; styling, display overrides, internal markers, and keymaps
-        ;; we layered on — paste should give plain chars, not our
-        ;; implementation cruft.
-        (put-text-property (point-min) (point-max)
-                           'yank-handler
-                           (list (lambda (s)
-                                   (insert (substring-no-properties s)))))
         ;; Mark rendered chars `fontified' so jit-lock never re-runs over
         ;; them during a mouse drag.  We style via `face'/`font-lock-face'
         ;; text properties, not font-lock keywords (`font-lock-defaults'
@@ -854,11 +835,16 @@ with face `agent-shell-markdown-header-2' on \"My title\"."
 
 The body of each well-formed `` `X` `` is left in place with
 face `agent-shell-markdown-inline-code' and tagged with the text
-property `agent-shell-markdown-frozen t' so it is never re-processed
+property `agent-shell-markdown-frozen t' so it is not re-processed
 on subsequent calls (the body can legitimately contain
 markdown-looking chars like `**' once the surrounding backticks
 are gone).  Spans inside any of AVOID-RANGES (typically fenced
 code blocks) are left untouched.
+
+The tag stops passes that would read the body as markup, which is all
+of them but one: `agent-shell-markdown--linkify-file-references' links
+a `path:line' citation in here, adding properties without reading the
+body as markup, so what the tag is for survives.
 
 For example, the buffer \"a `code` b\" becomes \"a code b\" with
 face `agent-shell-markdown-inline-code' on \"code\"."
@@ -966,15 +952,15 @@ browser\", and hovering shows \"Open in browser\"."
   (let* ((open-action (lambda () (interactive)
                         (agent-shell-markdown--open-link url)))
          (link-map (agent-shell-markdown--make-ret-binding-map open-action)))
-    (add-face-text-property start end 'agent-shell-markdown-link)
+    (agent-shell-markdown--add-link-face start end)
     (put-text-property start end 'keymap link-map)
-    (put-text-property start end 'cursor-sensor-functions
-                       (agent-shell-markdown--make-hint-sensor
-                        (lambda ()
-                          (agent-shell-markdown--action-hint
-                           :action open-action
-                           :keymap link-map
-                           :verb (agent-shell-markdown--link-verb url verb)))))
+    (agent-shell-markdown--put-hint-sensor
+     start end
+     (lambda ()
+       (agent-shell-markdown--action-hint
+        :action open-action
+        :keymap link-map
+        :verb (agent-shell-markdown--link-verb url verb))))
     ;; The mouse gets the same wording without a key in it, resolved on
     ;; hover like the echoed hint is.
     (put-text-property start end 'help-echo
@@ -985,6 +971,29 @@ browser\", and hovering shows \"Open in browser\"."
     ;; A hand pointer when over is enough. No need for `mouse-face'.
     (put-text-property start end 'pointer 'hand)
     (put-text-property start end 'agent-shell-markdown-url url)))
+
+(defun agent-shell-markdown--add-link-face (start end)
+  "Add the link face over [START, END), skipping where it already is.
+
+`add-face-text-property' drops a face the text already carries, but
+only where that face is all it carries.  Over text faced
+`(agent-shell-markdown-link agent-shell-markdown-bold)' -- a link
+inside bold -- re-applying ours composes a second copy of it instead.
+
+A link redone at a new length (see
+`agent-shell-markdown--outgrown-link-p') covers text it faced already,
+so this adds per sub-range: what the text legitimately carries is kept,
+and ours goes on once.
+
+For example, over a span whose first half is already a link, only the
+second half gains the face."
+  (let ((pos start))
+    (while (< pos end)
+      (let ((next (next-single-property-change pos 'face nil end)))
+        (unless (memq 'agent-shell-markdown-link
+                      (ensure-list (get-text-property pos 'face)))
+          (add-face-text-property pos next 'agent-shell-markdown-link))
+        (setq pos next)))))
 
 (cl-defun agent-shell-markdown--replace-links (&key avoid-ranges)
   "Replace `[title](url)' markup with title faced as link.
@@ -1072,7 +1081,7 @@ text, with \"https://example.com\" faced and openable."
             (goto-char (cdr avoid))
           (agent-shell-markdown--linkify-url start end))))))
 
-(defun agent-shell-markdown--linkify-url (start end)
+(cl-defun agent-shell-markdown--linkify-url (start end &key in-code)
   "Give the URL on [START, END) the properties a rendered link carries.
 
 A no-op when an earlier pass already spoke for that text: a link's or
@@ -1080,14 +1089,53 @@ fallback image's target, a `file://' image path rendered in place
 \(which tags itself frozen, and whose RET opens the file rather than
 the URL), or an image displayed over text that reads as a URL.
 
+IN-CODE non-nil says [START, END) is an inline `code' span body, which
+`agent-shell-markdown--style-inline-code' tags frozen to mark its own
+work rather than to fend off later passes.  There the tag says nothing
+about the text being spoken for, so it does not disqualify it.  Pass
+this only for a span positively identified as inline code -- see
+`agent-shell-markdown--linkify-file-references', which reads it off the
+inline ranges it was handed rather than off the tag.
+
+The exception is a link of this pass's own making that has since
+outgrown itself, which is redone at its new length (see
+`agent-shell-markdown--outgrown-link-p').
+
 For example, over the URL in \"see https://example.com now\", RET
 there opens it in the browser."
-  (when-let* (((not (get-text-property start 'agent-shell-markdown-url)))
-              ((not (get-text-property start 'agent-shell-markdown-frozen)))
-              ((not (eq (car-safe (get-text-property start 'display)) 'image))))
+  (when-let* (((or in-code
+                   (not (get-text-property start 'agent-shell-markdown-frozen))))
+              ((not (eq (car-safe (get-text-property start 'display)) 'image)))
+              ((or (not (get-text-property start 'agent-shell-markdown-url))
+                   (agent-shell-markdown--outgrown-link-p start end))))
     (agent-shell-markdown--apply-link-properties
      :start start :end end
      :url (buffer-substring-no-properties start end))))
+
+(defun agent-shell-markdown--outgrown-link-p (start end)
+  "Return non-nil when the link at START covers only part of [START, END).
+
+Text streams in a chunk at a time, so a URL or file reference is
+rendered while the rest of it is still coming: \"https://example.com/fo\"
+is a URL in its own right, and `foo.el:1' a reference to line 1, until
+the next chunk lands.  Since a rendered link is not linkified twice,
+what was linked stays short -- pointing somewhere real but wrong --
+unless the grown text is recognized as the same link.
+
+That it is one of ours is what makes redoing it safe: a link this pass
+rendered targets the very text under it, so a target matching the text
+it covers means we are looking at our own work rather than at a
+`[title](url)' link that happens to display a URL.
+
+For example, with \"https://example.com/fo\" linked and \"o\" just
+streamed in, returns non-nil for the span covering
+\"https://example.com/foo\"."
+  (when-let* ((url (get-text-property start 'agent-shell-markdown-url))
+              (link-end (next-single-property-change
+                         start 'agent-shell-markdown-url nil end))
+              ((< link-end end))
+              ((equal url (buffer-substring-no-properties start link-end))))
+    t))
 
 (defun agent-shell-markdown--image-attributes-pending-p (pos)
   "Return non-nil when an image ending at POS may still gain `{...}' attributes.
@@ -1237,12 +1285,12 @@ For example, the buffer \"see ![logo](logo.png)\" becomes
                   (put-text-property markup-start end 'keymap image-keymap)
                   ;; Nothing about a displayed image says it's actionable, so
                   ;; echo what its keys do as the cursor enters.
-                  (put-text-property markup-start end 'cursor-sensor-functions
-                                     (agent-shell-markdown--make-hint-sensor
-                                      (lambda ()
-                                        (agent-shell-markdown--image-hint
-                                         :action open-action
-                                         :keymap image-keymap))))
+                  (agent-shell-markdown--put-hint-sensor
+                   markup-start end
+                   (lambda ()
+                     (agent-shell-markdown--image-hint
+                      :action open-action
+                      :keymap image-keymap)))
                   ;; The mouse gets the same wording without a key in it.
                   ;; Resizing is left out: it's keys-only.
                   (put-text-property markup-start end 'help-echo "Open image")
@@ -1327,12 +1375,12 @@ renders the image in place of that text."
                 (put-text-property path-start path-end 'keymap image-keymap)
                 ;; Nothing about a displayed image says it's actionable, so
                 ;; echo what its keys do as the cursor enters.
-                (put-text-property path-start path-end 'cursor-sensor-functions
-                                   (agent-shell-markdown--make-hint-sensor
-                                    (lambda ()
-                                      (agent-shell-markdown--image-hint
-                                       :action open-action
-                                       :keymap image-keymap))))
+                (agent-shell-markdown--put-hint-sensor
+                 path-start path-end
+                 (lambda ()
+                   (agent-shell-markdown--image-hint
+                    :action open-action
+                    :keymap image-keymap)))
                 ;; The mouse gets the same wording without a key in it.
                 ;; Resizing is left out: it's keys-only.
                 (put-text-property path-start path-end 'help-echo "Open image")
@@ -1620,7 +1668,11 @@ with `emacs-lisp-mode' face properties on the body and a
                                :keymap label-map
                                :verb "copy")))
                            'agent-shell-markdown-frozen t
-                           'rear-nonsticky '(agent-shell-markdown-frozen)
+                           ;; `cursor-sensor-functions' included so the
+                           ;; hint stops at the label rather than showing
+                           ;; on the character after it.
+                           'rear-nonsticky '(agent-shell-markdown-frozen
+                                             cursor-sensor-functions)
                            'line-prefix prefix
                            'wrap-prefix prefix))
                    ;; Top vpad `\\n' + label + middle vpad `\\n' + a
@@ -3043,23 +3095,6 @@ allocated narrower than its natural total, see
             (setq col (1+ col))))))
     min-widths))
 
-(cl-defun agent-shell-markdown--fill-text-property (&key start end property value)
-  "Put PROPERTY VALUE between START and END, skipping chars that carry it.
-
-Leaves the chars that already have PROPERTY alone, so a blanket
-property can be laid over a region holding more specific ones without
-taking them out (a table filling in `keymap' around the links rendered
-inside its cells, say).
-
-For example, over \"ab\" with `keymap' already on \"a\", only \"b\"
-comes away with VALUE."
-  (let ((pos start))
-    (while (< pos end)
-      (let ((next (next-single-property-change pos property nil end)))
-        (unless (get-text-property pos property)
-          (put-text-property pos next property value))
-        (setq pos next)))))
-
 (defun agent-shell-markdown--render-table (table)
   "Render TABLE by replacing [:start, :end] with the rendered :source.
 
@@ -3118,19 +3153,13 @@ rendered region from inheriting either of our two properties."
       ;; follow-up pass and would otherwise render mostly greyed out.
       (agent-shell-markdown--mirror-face-to-font-lock-face table-start end)
       (put-text-property table-start end 'fontified t)
-      ;; Cells carry whatever the inline passes left there, links and
-      ;; images included, so fill in around their `keymap' and
-      ;; `cursor-sensor-functions' rather than over them: navigation
-      ;; reaches the rest of the table without taking RET away from a
-      ;; link sitting in a cell.
-      (agent-shell-markdown--fill-text-property
-       :start table-start :end end
-       :property 'keymap :value agent-shell-markdown-table-map)
-      (agent-shell-markdown--fill-text-property
-       :start table-start :end end
-       :property 'cursor-sensor-functions
-       :value (agent-shell-markdown--make-hint-sensor
-               #'agent-shell-markdown--table-hint)))))
+      ;; A table echoes no hint of its own, but the blanket
+      ;; `rear-nonsticky' above replaced what a link rendered inside a
+      ;; cell left there.  Re-adding `cursor-sensor-functions' is what
+      ;; stops that link's hint at its last character, rather than
+      ;; answering one position past it.
+      (agent-shell-markdown--add-rear-nonsticky
+       table-start end 'cursor-sensor-functions))))
 
 (defun agent-shell-markdown-rerender-tables ()
   "Re-lay out tables whose stored width no longer matches the display.
@@ -3571,8 +3600,7 @@ collapsed text are skipped, as for
 For example, in \"see docs and more\" where `docs' renders a link,
 returns the position of `docs'."
   (agent-shell-markdown--search-visible
-   :property 'agent-shell-markdown-url
-   :predicate #'identity))
+   :property 'agent-shell-markdown-url))
 
 (defun agent-shell-markdown--previous-visible-link ()
   "From point, return the start of the previous visible rendered link, or nil.
@@ -3580,7 +3608,6 @@ Skips links hidden inside collapsed text (see
 `agent-shell-markdown--next-visible-link')."
   (agent-shell-markdown--search-visible
    :property 'agent-shell-markdown-url
-   :predicate #'identity
    :backwards t))
 
 (defun agent-shell-markdown--next-visible-source-block ()
@@ -3594,8 +3621,7 @@ first line.  Blocks hidden inside collapsed text are skipped, as for
 For example, in a buffer holding one rendered \"python ⧉\" block,
 returns the position of its `⧉'."
   (agent-shell-markdown--search-visible
-   :property 'agent-shell-markdown-source-block-copy
-   :predicate #'identity))
+   :property 'agent-shell-markdown-source-block-copy))
 
 (defun agent-shell-markdown--previous-visible-source-block ()
   "From point, return the position of the previous visible source block, or nil.
@@ -3603,21 +3629,28 @@ Skips blocks hidden inside collapsed text (see
 `agent-shell-markdown--next-visible-source-block')."
   (agent-shell-markdown--search-visible
    :property 'agent-shell-markdown-source-block-copy
-   :predicate #'identity
    :backwards t))
 
-(cl-defun agent-shell-markdown--search-visible (&key property predicate backwards)
+(cl-defun agent-shell-markdown--search-visible (&key property (predicate #'identity) backwards)
   "From point, return the start of the nearest visible PROPERTY run, or nil.
 
 PREDICATE is called with the run's PROPERTY value and returns non-nil
-for a run worth stopping at.  Searches forward, or backwards when
-BACKWARDS is non-nil.  The run point is already on isn't a match, so
-repeated calls advance rather than sticking.  Runs whose start is
-`invisible' are skipped, being text nothing shows.
+for a run worth stopping at, defaulting to stopping at any run
+carrying PROPERTY.  Searches forward, or backwards when BACKWARDS is
+non-nil.  The run point is already on isn't a match, so repeated calls
+advance rather than sticking.  Runs whose start is `invisible' are
+skipped, being text nothing shows.
 
 For example, with PROPERTY `display' and a PREDICATE matching image
-values, returns the position of the next image."
+values, returns the position of the next image, and with PROPERTY
+`agent-shell-markdown-table-cell-start' alone the next table cell."
   (catch 'found
+    ;; Skipping an invisible run terminates because the search leaves
+    ;; point past the run it answered with (at its end going forward, at
+    ;; its start going backwards), so each pass has less buffer left to
+    ;; cover and eventually answers nil at either end.  Point moving is
+    ;; the whole of it: wrap the search in a `save-excursion' and the
+    ;; same run matches forever.
     (while t
       (let ((match (funcall (if backwards
                                 #'text-property-search-backward
@@ -3699,12 +3732,16 @@ window\") and an integer as pixels (350 as \"350px\")."
 Filters out properties our rendering itself sets (`face',
 `font-lock-face', `agent-shell-markdown-frozen',
 `agent-shell-markdown-table-source', `agent-shell-markdown-source',
-`rear-nonsticky') so callers' application-level properties such as
-`read-only' or `agent-shell' block ids survive on the rendered
-output.  `font-lock-face' in particular must not be carried: the
-first char's value (e.g. a table border) would otherwise be
-spread uniformly across the re-rendered region, greying out the
-per-cell styling on re-render."
+`rear-nonsticky', `keymap', `cursor-sensor-functions') so callers'
+application-level properties such as `read-only' or `agent-shell'
+block ids survive on the rendered output.
+
+The three that are ours but not obviously so must not be carried,
+since the first char's value would be spread uniformly across the
+re-rendered region: `font-lock-face' (e.g. a table border) greys out
+the per-cell styling, while `keymap' and `cursor-sensor-functions' (a
+link's own, say) take RET and the hint away from a link rendered
+inside a cell.  Each is re-established after the insert anyway."
   (let ((props (text-properties-at pos))
         (carried nil))
     (while props
@@ -3715,13 +3752,64 @@ per-cell styling on re-render."
                             agent-shell-markdown-frozen
                             agent-shell-markdown-table-source
                             agent-shell-markdown-source
-                            rear-nonsticky))
+                            rear-nonsticky
+                            keymap
+                            cursor-sensor-functions))
           (setq carried (cons val (cons key carried))))
         (setq props (cddr props))))
     (nreverse carried)))
 
-(defun agent-shell-markdown-reconstruct (beg end)
+(defun agent-shell-markdown-header-level (source)
+  "Return the heading level SOURCE opens with, or nil when it opens none.
+
+SOURCE is a span's stashed markdown, as stamped on
+`agent-shell-markdown-source'.  Only a span the renderer stashed as a
+header is considered, so a \"#\" opening a line inside a fenced code
+block is never mistaken for one.
+
+For example:
+
+  \"## Sub\"  => 2
+  \"body\"   => nil"
+  (when (string-match (rx bos (zero-or-more blank) (group (one-or-more "#"))
+                          (one-or-more blank))
+                      source)
+    (length (match-string 1 source))))
+
+(defun agent-shell-markdown-deepest-header (beg end)
+  "Return the deepest heading level rendered between BEG and END, or nil.
+
+Callers nesting the text under headings of their own use this to work
+out how far they can push the agent's headings down before running past
+the six levels markdown allows.
+
+For example, over a region rendering \"# Top\" and \"#### Deep\" returns 4,
+leaving room to push everything down two levels."
+  (let ((deepest nil)
+        (pos beg))
+    (while (< pos end)
+      (when-let* ((source (get-text-property pos 'agent-shell-markdown-source))
+                  (level (agent-shell-markdown-header-level source)))
+        (setq deepest (max level (or deepest 0))))
+      (setq pos (or (next-single-property-change
+                     pos 'agent-shell-markdown-source nil end)
+                    end)))
+    deepest))
+
+(defun agent-shell-markdown--deepen-header (source levels)
+  "Return SOURCE with its heading pushed down LEVELS, or SOURCE unchanged.
+SOURCE keeps its text when it opens no heading."
+  (if (agent-shell-markdown-header-level source)
+      (concat (make-string levels ?#) source)
+    source))
+
+(defun agent-shell-markdown-reconstruct (beg end &optional deepen)
   "Return the text between BEG and END with the original markdown restored.
+
+With DEEPEN, every heading is pushed down that many levels, so a caller
+can nest the result under headings of its own.  Applied per stashed
+span, never by scanning the output, so a \"#\" opening a line inside a
+fenced code block is left alone.
 
 Each rendered construct stashes the markdown for its span on the
 `agent-shell-markdown-source' text property.  A span fully contained
@@ -3758,7 +3846,7 @@ always fully inside the markup span, so the containment test holds)."
                      (min (1+ pos) (point-max))
                      'agent-shell-markdown-source nil (point-min))
                     beg))
-           source)
+           (if deepen (agent-shell-markdown--deepen-header source deepen) source))
           ;; Plain text, or a partially-selected span: emit as shown.
           (t (buffer-substring-no-properties pos limit)))
          parts)
@@ -3945,44 +4033,56 @@ Inverse of `agent-shell-markdown-table-next-cell'."
   (interactive)
   (agent-shell-markdown-table--move-cell :backward))
 
-(defun agent-shell-markdown--table-hint ()
-  "Return the hint text a rendered table echoes as the cursor enters it.
-
-Names the keys `agent-shell-markdown-table-map' binds for moving
-between cells, or nil when it binds none.  Nothing about a rendered
-table says its cells are navigable, so the hint is what makes them
-discoverable.
-
-For example, this returns \"Press TAB/<backtab> to move between
-cells\" with the default bindings."
-  (when-let* ((keys (seq-keep (lambda (action)
-                                (agent-shell-markdown--action-key
-                                 :action action
-                                 :keymap agent-shell-markdown-table-map))
-                              (list #'agent-shell-markdown-table-next-cell
-                                    #'agent-shell-markdown-table-previous-cell))))
-    (format "Press %s to move between cells" (string-join keys "/"))))
-
 (defun agent-shell-markdown-table--move-cell (direction)
   "Move point to the next or previous cell in the table at point.
 DIRECTION is `:forward' or `:backward'.  Signals `user-error' when
-there's no cell in that direction."
-  (let* ((cells (agent-shell-markdown-table--cell-starts))
-         ;; Largest cell-start index whose position is <= point — the
-         ;; cell currently containing point.  -1 means point is before
-         ;; the first cell.  CELLS is sorted ascending so we just walk
-         ;; it tracking the last index that still satisfies the bound.
-         (point-pos (point))
-         (current -1)
-         (i 0))
-    (dolist (c cells)
-      (when (<= c point-pos)
-        (setq current i))
-      (setq i (1+ i)))
-    (let ((target (if (eq direction :forward) (1+ current) (1- current))))
-      (if (and cells (<= 0 target) (< target (length cells)))
-          (goto-char (nth target cells))
-        (user-error "No more cells left")))))
+there's no cell in that direction, that is at the table's edges (its
+last cell going forward, its first going backward) and outside a table."
+  (if-let* ((cells (agent-shell-markdown-table--cell-starts))
+            ;; Cells at or before point, the last of them being the one
+            ;; point is in.  None of them when point sits ahead of the
+            ;; first cell (on the table's top border, say), so
+            ;; `:forward' lands on that first cell.
+            (target (+ (seq-count (lambda (cell)
+                                    (<= cell (point)))
+                                  cells)
+                       (if (eq direction :forward) 0 -2)))
+            ((<= 0 target))
+            (position (nth target cells)))
+      (goto-char position)
+    (user-error "No more cells left")))
+
+(cl-defun agent-shell-markdown-table--entry-position (&key position from)
+  "Return where navigating to POSITION lands, with point coming FROM.
+
+That's the first cell of the table POSITION sits in, a table being
+entered at its first cell whatever part of one navigation found (a link
+rendered in its third cell, say).  POSITION comes back unchanged when
+it's outside any table, and when it's inside the same table as FROM,
+whose cells and the links in them navigation walks one by one.
+
+For example, with POSITION on a link in the last cell of a table,
+returns that table's first cell for a FROM ahead of the table, and the
+link itself for a FROM already inside it."
+  (or (when-let* ((table (save-excursion
+                           (goto-char position)
+                           (agent-shell-markdown-table--region-at-point)))
+                  ((not (and (<= (car table) from)
+                             (< from (cdr table))))))
+        (agent-shell-markdown-table--first-cell position))
+      position))
+
+(defun agent-shell-markdown-table--first-cell (position)
+  "Return the first navigable cell of the table at POSITION, or nil.
+Nil when POSITION isn't inside a rendered table.
+
+A table's entry point (see
+`agent-shell-markdown-table--entry-position'), and where
+`agent-shell-backward-up-item' returns point to from whichever cell
+navigation walked into."
+  (save-excursion
+    (goto-char position)
+    (seq-first (agent-shell-markdown-table--cell-starts))))
 
 (defun agent-shell-markdown-table--cell-starts ()
   "Return a sorted list of cell-start positions in the table at point.
@@ -4127,6 +4227,39 @@ block's label."
                                                      :keymap keymap)))
     (format "Press %s to %s" key verb)))
 
+(defun agent-shell-markdown--put-hint-sensor (start end hint)
+  "Echo HINT as the cursor enters [START, END).
+
+Puts HINT's sensor (see `agent-shell-markdown--make-hint-sensor') and
+marks `cursor-sensor-functions' rear-nonsticky across the span, which
+is what stops the hint at the span's last character.
+
+`cursor-sensor' reads the property with `get-pos-property' before
+falling back to `get-char-property', and `get-pos-property' reports
+what text inserted at a position would inherit rather than what sits
+there.  A sticky value therefore still answers one position past the
+end, showing a link's hint while point is on the space after it."
+  (put-text-property start end 'cursor-sensor-functions
+                     (agent-shell-markdown--make-hint-sensor hint))
+  (agent-shell-markdown--add-rear-nonsticky start end 'cursor-sensor-functions))
+
+(defun agent-shell-markdown--add-rear-nonsticky (start end property)
+  "Mark PROPERTY rear-nonsticky between START and END.
+
+Adds to whatever `rear-nonsticky' is already there rather than
+replacing it, the span typically carrying others (a table's own, say)
+whose stickiness would otherwise be dropped."
+  (let ((pos start))
+    (while (< pos end)
+      (let ((next (next-single-property-change pos 'rear-nonsticky nil end))
+            (sticky (get-text-property pos 'rear-nonsticky)))
+        ;; `t' already means every property is rear-nonsticky.
+        (unless (eq sticky t)
+          (put-text-property pos next 'rear-nonsticky
+                             (cons property
+                                   (delq property (copy-sequence sticky)))))
+        (setq pos next)))))
+
 (defun agent-shell-markdown--make-hint-sensor (hint)
   "Return a `cursor-sensor-functions' value echoing HINT on entry.
 
@@ -4197,7 +4330,8 @@ Emacs 31+, falling back to `browse-url-of-file' on earlier versions."
 (defun agent-shell-markdown--binary-file-p (file)
   "Return non-nil when FILE looks binary (a NUL byte in its first 4KB).
 This is the heuristic git uses to tell binary from text."
-  (and (file-readable-p file)
+  (and (file-regular-p file)
+       (file-readable-p file)
        (with-temp-buffer
          (set-buffer-multibyte nil)
          (insert-file-contents-literally file nil 0 4096)
@@ -4236,14 +4370,19 @@ For example, to open beside the shell rather than over it:
           (display-buffer (find-file-noselect path)
                           \\='(display-buffer-pop-up-window))))")
 
-(cl-defun agent-shell-markdown-visit-file (&key file line-start line-end)
+(cl-defun agent-shell-markdown-visit-file (&key file line-start line-end column)
   "Visit FILE, selecting lines LINE-START to LINE-END when given.
 
 Opens FILE through `agent-shell-markdown-open-file-function', which
 owns where it is displayed.  Without LINE-START, that is all.  With
 one, point lands on that line in the window that function returns, and
-LINE-END selects through the end of its line.  Messages instead when
-FILE no longer exists.
+LINE-END selects through the end of its line.  Without one, any region
+left active in FILE by an earlier jump is deactivated, point having
+moved out from under it -- whatever `transient-mark-mode' is, matching
+the range above, which activates the mark either way.  COLUMN, counted
+from 1 as the agents citing
+one do, moves point that far into the line, stopping at its end when
+the line is shorter.  Messages instead when FILE no longer exists.
 
 Where the link was followed from goes on xref's marker stack, so
 \\[xref-go-back] comes back to it, as it does from any other jump.
@@ -4264,13 +4403,24 @@ LINE-START 2 and LINE-END 3 leave \"two\\nthree\" as the region."
         (with-selected-window window
           (goto-char (point-min))
           (forward-line (1- line-start))
-          (when line-end
-            (push-mark (save-excursion
-                         (goto-char (point-min))
-                         (forward-line (1- line-end))
-                         (end-of-line)
-                         (point))
-                       t t))))
+          (when column
+            (forward-char (min (max 0 (1- column))
+                               (- (line-end-position) (point)))))
+          (if line-end
+              (push-mark (save-excursion
+                           (goto-char (point-min))
+                           (forward-line (1- line-end))
+                           (end-of-line)
+                           (point))
+                         t t)
+            ;; Point just moved, so a region still active from an earlier
+            ;; jump into this same file now runs from that jump's mark to
+            ;; wherever this one landed, highlighting a span nothing asked
+            ;; for.  Forced, since the range above activates the mark
+            ;; whatever `transient-mark-mode' says and this has to match it.
+            ;; Only the activation goes; the mark itself stays where it was,
+            ;; as any other jump leaves it.
+            (deactivate-mark t))))
       window)))
 
 (defun agent-shell-markdown--open-file (path)
@@ -4300,47 +4450,77 @@ meaningless for binary)."
       (agent-shell-markdown-visit-file
        :file (map-elt parsed :file)
        :line-start (map-elt parsed :line-start)
-       :line-end (map-elt parsed :line-end)))
+       :line-end (map-elt parsed :line-end)
+       :column (map-elt parsed :column)))
     t))
 
-(defconst agent-shell-markdown--lines-regexp
+(defconst agent-shell-markdown--location-regexp
   (rx (one-or-more digit)
-      (optional "-" (optional "L") (one-or-more digit)))
-  "Regexp for the line part of a local link, a number or a range.
-Matches \"10\", \"10-24\" and GitHub's \"10-L24\".")
+      (optional (or (seq "-" (optional "L") (one-or-more digit))
+                    (seq ":" (one-or-more digit)))))
+  "Regexp for the location part of a local link, what follows the file.
+Matches a line (\"10\"), a range (\"10-24\", GitHub's \"10-L24\") and a
+line with a column (\"10:5\").")
 
-(defun agent-shell-markdown--parse-lines (lines)
-  "Parse LINES, the line part of a local link, into a (START . END) cons.
+(defconst agent-shell-markdown--file-reference-regexp
+  (rx (any alnum "._~/@_")
+      (zero-or-more (any alnum "._~/@+_-"))
+      (or "#L" ":")
+      (regexp agent-shell-markdown--location-regexp))
+  "Regexp matching a bare `path:line' reference as agents cite sources.
 
-END is nil unless LINES names a range.
+Matches the whole reference, path included, in the forms
+`agent-shell-markdown--parse-local-link' reads: `docs/audit.md:500',
+`src/main.rs:120-140', `foo.el:12:5' and `foo.el#L12'.  A line is
+required, so a bare path in prose is not a reference.
+
+Whether the path names an existing file is not asked here -- see
+`agent-shell-markdown--linkify-file-references', which is what filters
+the candidates this finds.")
+
+(defun agent-shell-markdown--parse-location (location)
+  "Parse LOCATION, the location part of a local link, into an alist.
+
+The alist carries :line-start, plus :line-end when LOCATION names a
+range and :column when it names a line and a column.  A key it does not
+name is left out rather than held nil, reading the same through
+`map-elt'.  Returns nil when LOCATION is none of those forms.
 
 For example:
 
-  \"10\"     => (10)
-  \"10-24\"  => (10 . 24)
-  \"10-L24\" => (10 . 24)"
+  \"10\"     => ((:line-start . 10))
+  \"10-24\"  => ((:line-start . 10) (:line-end . 24))
+  \"10-L24\" => ((:line-start . 10) (:line-end . 24))
+  \"10:5\"   => ((:line-start . 10) (:column . 5))"
   (when (string-match (rx bos (group (one-or-more digit))
-                          (optional "-" (optional "L")
-                                    (group (one-or-more digit)))
+                          (optional (or (seq "-" (optional "L")
+                                             (group (one-or-more digit)))
+                                        (seq ":" (group (one-or-more digit)))))
                           eos)
-                      lines)
-    (cons (string-to-number (match-string 1 lines))
-          (when (match-string 2 lines)
-            (string-to-number (match-string 2 lines))))))
+                      location)
+    (delq nil
+          (list (cons :line-start (string-to-number (match-string 1 location)))
+                (when (match-string 2 location)
+                  (cons :line-end (string-to-number (match-string 2 location))))
+                (when (match-string 3 location)
+                  (cons :column (string-to-number (match-string 3 location))))))))
 
 (defun agent-shell-markdown--parse-local-link (url)
   "Parse URL as a local file link.
 
-Return an alist with :file, :line-start and :line-end when URL points to
-an existing local file, or nil otherwise.  Both line keys are nil when
-URL names no line, and :line-end is nil unless it names a range.
+Return an alist with :file, :line-start, :line-end and :column when URL
+points to an existing local file, or nil otherwise.  Only :file is
+there when URL names no location, :line-end only for a range and
+:column only for a column -- absent keys reading nil through `map-elt'
+as a caller wants anyway.
 
 For example, with the file part abbreviated to F:
 
-  \"foo.el#L10\"          => ((:file . F) (:line-start . 10) (:line-end))
+  \"foo.el#L10\"          => ((:file . F) (:line-start . 10))
   \"foo.el#L10-L24\"      => ((:file . F) (:line-start . 10) (:line-end . 24))
   \"foo.el#L10-24\"       => ((:file . F) (:line-start . 10) (:line-end . 24))
-  \"foo.el\"              => ((:file . F) (:line-start) (:line-end))
+  \"foo.el:10:5\"         => ((:file . F) (:line-start . 10) (:column . 5))
+  \"foo.el\"              => ((:file . F))
   \"file:bar.el:5-8\"     => ((:file . F) (:line-start . 5) (:line-end . 8))
   \"https://example.com\" => nil"
   (when-let* ((match
@@ -4348,8 +4528,8 @@ For example, with the file part abbreviated to F:
                 ((string-match
                   (rx bos "file://"
                       (group (+? anything))
-                      (optional (or (seq "#L" (group (regexp agent-shell-markdown--lines-regexp)))
-                                    (seq ":" (group (regexp agent-shell-markdown--lines-regexp)))))
+                      (optional (or (seq "#L" (group (regexp agent-shell-markdown--location-regexp)))
+                                    (seq ":" (group (regexp agent-shell-markdown--location-regexp)))))
                       eos)
                   url)
                  (cons (match-string 1 url)
@@ -4357,8 +4537,8 @@ For example, with the file part abbreviated to F:
                 ((string-match
                   (rx bos "file:"
                       (group (not (any "/")) (+? anything))
-                      (optional (or (seq "#L" (group (regexp agent-shell-markdown--lines-regexp)))
-                                    (seq ":" (group (regexp agent-shell-markdown--lines-regexp)))))
+                      (optional (or (seq "#L" (group (regexp agent-shell-markdown--location-regexp)))
+                                    (seq ":" (group (regexp agent-shell-markdown--location-regexp)))))
                       eos)
                   url)
                  (cons (match-string 1 url)
@@ -4367,7 +4547,7 @@ For example, with the file part abbreviated to F:
                   (rx bos
                       (group (? (optional "/") alpha ":/")
                              (one-or-more (not (any ":#"))))
-                      "#L" (group (regexp agent-shell-markdown--lines-regexp))
+                      "#L" (group (regexp agent-shell-markdown--location-regexp))
                       eos)
                   url)
                  (cons (match-string 1 url) (match-string 2 url)))
@@ -4375,7 +4555,7 @@ For example, with the file part abbreviated to F:
                   (rx bos
                       (group (? (optional "/") alpha ":/")
                              (one-or-more (not (any ":#"))))
-                      ":" (group (regexp agent-shell-markdown--lines-regexp))
+                      ":" (group (regexp agent-shell-markdown--location-regexp))
                       eos)
                   url)
                  (cons (match-string 1 url) (match-string 2 url)))
@@ -4383,11 +4563,72 @@ For example, with the file part abbreviated to F:
                  (cons url nil))))
               (filepath (expand-file-name (car match))))
     (when (file-exists-p filepath)
-      (let ((lines (when (cdr match)
-                     (agent-shell-markdown--parse-lines (cdr match)))))
-        (list (cons :file filepath)
-              (cons :line-start (car lines))
-              (cons :line-end (cdr lines)))))))
+      (cons (cons :file filepath)
+            (when (cdr match)
+              (agent-shell-markdown--parse-location (cdr match)))))))
+
+(cl-defun agent-shell-markdown--linkify-file-references (&key avoid-ranges inline-ranges)
+  "Face bare `path:line' references in prose as links opening the file.
+
+Agents cite their sources constantly (`docs/audit.md:500',
+`src/main.rs:120-140', `foo.el:12:5'), and those citations are
+otherwise plain text.  Each one naming a file that exists gains what
+any rendered link carries (see
+`agent-shell-markdown--apply-link-properties'), so RET opens the file
+at the cited line and item navigation stops there.
+
+What counts as a reference is `agent-shell-markdown--file-reference-regexp',
+read through `agent-shell-markdown--parse-local-link' as any other
+local link is.  There is no markup to strip, so the reference text
+stays as it stands.
+
+Two things keep prose from turning into links: a reference has to name
+a line, so a bare path is left alone, and its path -- resolved against
+`default-directory' -- has to name an existing file, so a lone `12:30'
+stays text.  A word char right after the number rules a match out too,
+since the number is then part of a longer word rather than a line.
+
+References inside any of AVOID-RANGES are left alone: fenced blocks,
+where a path is sample content or command output rather than a
+citation, and whatever earlier renders already froze, which is what
+keeps this off ground already covered.
+
+INLINE-RANGES are the inline `code' span bodies, and they are scanned
+rather than avoided -- agents wrap nearly every citation in backticks,
+that being how a path reads, so skipping them would skip most of what
+this is for.  A span in there is handed to
+`agent-shell-markdown--linkify-url' as code, which is what lets its
+frozen tag stand without being mistaken for another pass's claim.
+
+A reference still streaming in links as far as it has got and is
+redone as it grows, so `foo.el:1' does not stay pointing at line 1
+once the `2' of `foo.el:12' arrives (see
+`agent-shell-markdown--outgrown-link-p').
+
+For example, the buffer \"see docs/audit.md:500 now\" keeps its text,
+with \"docs/audit.md:500\" faced and opening that file at line 500."
+  (let ((case-fold-search nil))
+    (goto-char (point-min))
+    (while (re-search-forward agent-shell-markdown--file-reference-regexp nil t)
+      ;; Read before parsing below, which runs a `string-match' of its own
+      ;; and leaves no match data of this one behind to take positions from.
+      (let ((start (match-beginning 0))
+            (end (match-end 0)))
+        (if-let* ((avoid (agent-shell-markdown-in-avoid-range-p
+                          start end avoid-ranges)))
+            (goto-char (cdr avoid))
+          ;; Point sits right after the match, so this reads the char the
+          ;; number runs into: `foo.el#L2xy' is a word, not a reference.
+          (when (and (not (looking-at-p (rx (any alnum "_"))))
+                     (agent-shell-markdown--parse-local-link
+                      (buffer-substring-no-properties start end)))
+            ;; Inline code is the one place a frozen tag is expected here,
+            ;; and it is read off the ranges rather than the tag, so no
+            ;; other frozen text can slip through as code.
+            (agent-shell-markdown--linkify-url
+             start end
+             :in-code (agent-shell-markdown-in-avoid-range-p
+                       start end inline-ranges))))))))
 
 (cl-defun agent-shell-markdown--url-copy-file (&key url file (timeout 5.0) content-type-prefix)
   "Download URL to FILE, returning FILE on success or nil on failure.
@@ -4833,7 +5074,13 @@ otherwise look like markdown (e.g. inline code body or source
 block body).  Treating tagged ranges as avoid-ranges keeps
 subsequent calls from re-processing them — important for
 streaming, where the convert/replace-markup function may be
-invoked many times as content grows."
+invoked many times as content grows.
+
+One pass reads past the tag.  `agent-shell-markdown--linkify-file-references'
+links a `path:line' citation sitting in an inline `code' span, which
+agents write nearly all of them in.  It tells those spans apart by the
+inline ranges it is handed, never by the tag, so every other tagged
+range is still left alone (see `agent-shell-markdown--linkify-url')."
   (let ((ranges '())
         (pos (point-min))
         (limit (point-max)))
