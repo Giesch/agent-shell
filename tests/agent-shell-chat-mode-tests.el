@@ -869,7 +869,12 @@ Only the reprinted prompt is labeled, as the live one."
     (let ((me (agent-shell-chat-mode-tests--me-overlays)))
       (should (= 1 (length me)))
       (should (= (overlay-end (car me)) (point-max)))
-      (should (string-match-p "❯" (overlay-get (car me) 'before-string))))))
+      ;; The marker rides the overlay's `display' when a newline above
+      ;; carries the label, and its `before-string' otherwise.
+      (should (string-match-p
+               "❯"
+               (concat (overlay-get (car me) 'before-string)
+                       (or (overlay-get (car me) 'display) "")))))))
 
 (ert-deftest agent-shell-chat-after-output-filter-schedules-relabel-test ()
   "A moved `comint-last-prompt' schedules one relabel; an unmoved one none."
