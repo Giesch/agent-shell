@@ -1,0 +1,82 @@
+{
+  "provenance": {
+    "adapter": "codex-acp 1.10.0",
+    "sdk": "1.4.0",
+    "backend": "codex 0.153.4",
+    "adapterBundleSha256": "4602784c5896fbf05a7d89b09655bacc768d0bf281e0d03a10333ff81da45268",
+    "generation": "Installed buildUserInputRequest with synthetic backend parameters; not a live model request",
+    "command": "node tests/phase2-protocol.mjs ADAPTER_ROOT OUTPUT_FILE"
+  },
+  "backendInput": {
+    "threadId": "phase2-source",
+    "itemId": "source-question",
+    "turnId": "source-turn",
+    "isBlocking": true,
+    "autoResolutionMs": null,
+    "questions": [
+      {
+        "id": "text",
+        "header": "Text",
+        "question": "Enter a synthetic label.",
+        "isOther": false,
+        "isSecret": false,
+        "options": null
+      },
+      {
+        "id": "password",
+        "header": "Secret",
+        "question": "Enter a synthetic secret.",
+        "isOther": false,
+        "isSecret": true,
+        "options": null
+      }
+    ]
+  },
+  "request": {
+    "jsonrpc": "2.0",
+    "id": "source-text",
+    "method": "elicitation/create",
+    "params": {
+      "sessionId": "phase2-source",
+      "toolCallId": "source-question",
+      "mode": "form",
+      "message": "Input requested",
+      "requestedSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "description": "Enter a synthetic label.",
+            "_meta": {
+              "codex": {
+                "isOther": false,
+                "isSecret": false
+              }
+            },
+            "type": "string"
+          },
+          "password": {
+            "title": "Secret",
+            "description": "Enter a synthetic secret.",
+            "_meta": {
+              "codex": {
+                "isOther": false,
+                "isSecret": true
+              }
+            },
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "password"
+        ]
+      },
+      "_meta": {
+        "codex": {
+          "autoResolutionMs": null
+        }
+      }
+    }
+  }
+}

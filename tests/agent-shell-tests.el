@@ -4450,7 +4450,7 @@ Gemini sends these fields as empty arrays."
                            ((:value . "Session")
                             (:title . "Session")
                             (:description))))
-              (:custom)))
+              (:custom) (:kind . choice) (:secret)))
            (agent-shell--elicitation-form-fields
             '((type . "object")
               (properties . ((question_0 . ((type . "string")
@@ -4537,11 +4537,8 @@ order cannot orphan one."
                                              (oneOf . [((const . "a") (title . "a"))]))))))))
                   '(:custom :name)))))
 
-(ert-deftest agent-shell--elicitation-form-fields-drops-orphan-custom-answer-test ()
-  "Test a custom answer field naming no question is dropped.
-
-The box is optional and no schema listing one marks it required, so
-declining the whole form over it would lose a form this shell renders."
+(ert-deftest agent-shell--elicitation-form-fields-rejects-orphan-custom-answer-test ()
+  "Reject an orphan companion rather than silently dropping it."
   (let ((fields (agent-shell--elicitation-form-fields
                  '((type . "object")
                    (properties . ((question_0 . ((type . "string")
@@ -4551,26 +4548,16 @@ declining the whole form over it would lose a form this shell renders."
                                       (title . "Other")
                                       (_meta . ((_askUserQuestionCustomAnswer
                                                  . ((questionId . "question_9")))))))))))))
-    (should (equal 1 (length fields)))
-    (should-not (map-elt (car fields) :custom))))
+    (should (eq fields 'unsupported))))
 
-(ert-deftest agent-shell--elicitation-form-fields-drops-non-string-custom-answer-test ()
-  "Test a custom answer field this shell cannot read is dropped.
-
-The box is read as one line of text, so a field of another type is not
-one this shell can offer."
-  (should-not
-   (map-elt (car (agent-shell--elicitation-form-fields
+(ert-deftest agent-shell--elicitation-form-fields-rejects-non-string-custom-answer-test ()
+  "Reject malformed companion types."
+  (should (eq 'unsupported
+              (agent-shell--elicitation-form-fields
                   '((type . "object")
-                    (properties
-                     . ((question_0 . ((type . "string")
-                                       (oneOf . [((const . "a") (title . "a"))])))
-                        (question_0_custom
-                         . ((type . "number")
-                            (title . "Other")
-                            (_meta . ((_askUserQuestionCustomAnswer
-                                       . ((questionId . "question_0"))))))))))))
-            :custom)))
+                 (properties . ((q . ((type . "string") (oneOf . [((const . "a"))])))
+                                (other . ((type . "number")
+                                          (_meta . ((_askUserQuestionCustomAnswer . ((questionId . "q"))))))))))))))
 
 (ert-deftest agent-shell--elicitation-form-fields-multi-select-test ()
   "Test `agent-shell--elicitation-form-fields' walks a multi-select question.
@@ -4588,7 +4575,7 @@ The field is marked :multi, which the form renders as checkboxes."
                            ((:value . "Rendering")
                             (:title . "Rendering")
                             (:description))))
-              (:custom)))
+              (:custom) (:kind . multi-choice) (:secret)))
            (agent-shell--elicitation-form-fields
             '((type . "object")
               (properties . ((question_0 . ((type . "array")
@@ -4640,18 +4627,13 @@ one.  See `agent-shell--elicitation-form-fields-rejects-non-string-option-test'.
               (properties . ((question_0 . ((type . "array")
                                             (items . ((anyOf . [((const . 1) (title . "one"))]))))))))))))
 
-(ert-deftest agent-shell--elicitation-form-fields-rejects-required-test ()
-  "Test `agent-shell--elicitation-form-fields' declines a required list.
-
-An MCP form may mark fields required.  Skipping one would then make the
-answer invalid, so the whole form is declined."
-  (should (equal
-           'unsupported
-           (agent-shell--elicitation-form-fields
-            '((type . "object")
-              (required . ["question_0"])
-              (properties . ((question_0 . ((type . "string")
-                                            (oneOf . [((const . "a") (title . "a"))]))))))))))
+(ert-deftest agent-shell--elicitation-form-fields-accepts-required-test ()
+  "Normalize required properties for outgoing-content validation."
+  (let ((model (agent-shell--normalize-elicitation
+                '((type . "object") (required . ["q"])
+                  (properties . ((q . ((type . "string") (oneOf . [((const . "a"))])))))))))
+    (should (equal '(q) (map-elt model :required)))
+    (should-not (map-elt model :reason))))
 
 (ert-deftest agent-shell--elicitation-form-fields-rejects-unknown-type-test ()
   "Test `agent-shell--elicitation-form-fields' declines a non-select field."
@@ -6599,7 +6581,7 @@ or point never advances and `C-<return>' never submits."
                 (list (cons 'question_0_custom "OAuth"))))))
 
 (ert-deftest agent-shell--make-elicitation-custom-command-records-typed-text-test ()
-  "Test the Other button records trimmed text and drops the selection."
+  "Test the Other button preserves text and drops the selection."
   (with-temp-buffer
     (let* ((responses nil)
            (state (agent-shell-tests--elicitation-state (current-buffer)))
@@ -6615,7 +6597,7 @@ or point never advances and `C-<return>' never submits."
                     :state state :request-id 40 :client 'test-client
                     :field (agent-shell-tests--custom-answer-field)))
           (should-not responses)
-          (should (equal "OAuth"
+          (should (equal "  OAuth  "
                          (map-nested-elt state '(:elicitations 40 :answers question_0_custom))))
           (should-not (map-contains-key
                        (map-nested-elt state '(:elicitations 40 :answers))
@@ -6633,7 +6615,7 @@ or point never advances and `C-<return>' never submits."
                                   (cons 'question_0_custom "OAuth"))))))
       (cl-letf (((symbol-function 'agent-shell--state) (lambda () agent-shell--state))
                 ((symbol-function 'agent-shell--render-elicitation) (lambda (&rest _)))
-                ((symbol-function 'read-string) (lambda (&rest _) "   ")))
+                ((symbol-function 'read-string) (lambda (&rest _) "")))
         (agent-shell-tests--with-elicitation-stubs responses
           (funcall (agent-shell--make-elicitation-custom-command
                     :state state :request-id 41 :client 'test-client

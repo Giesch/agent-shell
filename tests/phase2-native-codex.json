@@ -1,0 +1,67 @@
+{
+  "provenance": {
+    "adapter": "codex-acp 1.10.0",
+    "sdk": "1.4.0",
+    "backend": "codex 0.153.4",
+    "date": "2026-09-07",
+    "generation": "Native question; session and tool IDs replaced",
+    "trigger": "Use request_user_input (Plan mode) / AskUserQuestion to ask Alpha versus Beta."
+  },
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 0,
+    "method": "elicitation/create",
+    "params": {
+      "sessionId": "phase2-native",
+      "toolCallId": "phase2-question",
+      "mode": "form",
+      "message": "Which do you choose: Alpha or Beta?",
+      "requestedSchema": {
+        "type": "object",
+        "properties": {
+          "alpha_or_beta": {
+            "title": "UI test",
+            "description": "Which do you choose: Alpha or Beta?",
+            "_meta": {
+              "codex": {
+                "isOther": true,
+                "isSecret": false
+              }
+            },
+            "type": "string",
+            "oneOf": [
+              {
+                "const": "Alpha",
+                "title": "Alpha",
+                "description": "Choose Alpha."
+              },
+              {
+                "const": "Beta",
+                "title": "Beta",
+                "description": "Choose Beta."
+              }
+            ]
+          },
+          "alpha_or_beta__other": {
+            "type": "string",
+            "title": "Other",
+            "description": "Type your own answer instead of choosing an option above.",
+            "_meta": {
+              "codex": {
+                "questionId": "alpha_or_beta",
+                "isOtherAnswer": true,
+                "isSecret": false
+              }
+            }
+          }
+        },
+        "required": []
+      },
+      "_meta": {
+        "codex": {
+          "autoResolutionMs": null
+        }
+      }
+    }
+  }
+}
