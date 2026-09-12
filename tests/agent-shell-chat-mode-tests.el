@@ -457,10 +457,10 @@ line, then the marker the input follows."
 (ert-deftest agent-shell-chat-marker-renders-once-test ()
   "The prompt marker is shown once, however many rows the label spans.
 
-With no newline above to carry it, the label renders on the prompt\\='s own
-overlay and each of its blank lines becomes a row of that line.  A marker
-travelling as a prefix would then repeat down every one of those rows,
-which is what a cleared shell renders."
+With no newline above to carry it (what a cleared shell renders), the
+label renders on the prompt\\='s own overlay, closed onto its own row
+with the marker joining the input\\='s row below.  A marker travelling
+as a prefix would repeat down every one of those rows instead."
   (agent-shell-chat-mode-tests--with-shell
     ;; A prompt starting the buffer has no newline above it, which is what
     ;; clearing the shell leaves behind.
@@ -492,6 +492,194 @@ renders."
       (should (string-match-p "Me" (or (overlay-get me 'before-string) "")))
       (should (equal "" (overlay-get me 'line-prefix)))
       (should (equal "" (overlay-get me 'wrap-prefix))))))
+
+(ert-deftest agent-shell-chat-first-me-heading-own-line-test ()
+  "A first prompt with nothing above carries one `Me' on its own row.
+
+The label leads the buffer with no blank rows imitating a preceding
+turn, closed by its own newline, with the marker joining the input's
+row below: the heading-to-body spacing later turns render.  Holds for
+a prompt starting the buffer (a fresh or cleared shell) and for one
+preceded by a lone newline, across the configured agents' prompts."
+  (dolist (prompt-text '("Codex> " "Pi> " "Claude> "))
+    (dolist (prefix '("" "\n"))
+      (agent-shell-chat-mode-tests--with-shell
+        (insert prefix)
+        (agent-shell-chat-mode-tests--prompt prompt-text)
+        (let ((agent-shell-prompt-bar-mode nil))
+          (agent-shell-chat--relabel))
+        (let ((mes (agent-shell-chat-mode-tests--me-overlays)))
+          (should (= 1 (length mes)))
+          (let* ((me (car mes))
+                 (before (or (overlay-get me 'before-string) "")))
+            (should (equal " Me \n  ❯ " (substring-no-properties before)))
+            (should (eq (get-text-property (string-match "Me" before)
+                                           'face before)
+                        'agent-shell-chat-me-label))
+            (should-not (string-match-p "❯" (or (overlay-get me 'line-prefix) "")))
+            (should (equal "" (overlay-get me 'wrap-prefix)))))))))
+
+(ert-deftest agent-shell-chat-first-me-heading-newline-topped-test ()
+  "A first prompt topped by newlines keeps later-turn heading spacing.
+
+  One blank line above the heading, however many newlines or blank
+  padding precede the prompt, and the heading still rides its own row
+  with the marker below it: the first turn reads like the later ones
+  without imitating a turn that is not there."
+  (dolist (fixture '(("\n\n" . "\\`\n Me \n")
+                     (" \n" . "\\` Me \n")))
+    (agent-shell-chat-mode-tests--with-shell
+      (insert (car fixture))
+      (agent-shell-chat-mode-tests--prompt "Claude> ")
+      (let ((agent-shell-prompt-bar-mode nil))
+        (agent-shell-chat--relabel))
+      (let ((mes (agent-shell-chat-mode-tests--me-overlays)))
+        (should (= 1 (length mes)))
+        (should (string-match (cdr fixture)
+                              (agent-shell-chat-mode-tests--label-string
+                               (car mes))))
+        (should (string-match-p "❯"
+                                (agent-shell-chat-mode-tests--marker-string
+                                 (car mes))))))))
+
+(ert-deftest agent-shell-chat-first-me-heading-draft-stability-test ()
+  "Editing a first prompt's draft keeps one heading and one marker.
+
+Typing, newlines, a trailing newline and deleting back to empty all
+leave a single `Me' heading, and the composing marker never repeats on
+the rows a draft grows.  No relabel runs while typing: the draft's own
+modification hooks carry the indent, so what relabel drew is what
+stays."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (agent-shell-chat--relabel))
+    (let ((prompt-end (point-max)))
+      (dolist (edit '("hello" "\nsecond line" "\n" "again"))
+        (goto-char (point-max))
+        (insert edit)
+        (let ((mes (agent-shell-chat-mode-tests--me-overlays))
+              (draft (agent-shell-chat-mode-tests--draft-overlay)))
+          (should (= 1 (length mes)))
+          (should (= 1 (seq-count (lambda (string)
+                                    (string-match-p "❯" string))
+                                  (list (or (overlay-get (car mes) 'before-string) "")
+                                        (or (overlay-get (car mes) 'display) "")
+                                        (or (overlay-get (car mes) 'line-prefix) "")
+                                        (or (overlay-get (car mes) 'wrap-prefix) "")
+                                        (or (overlay-get draft 'line-prefix) "")
+                                        (or (overlay-get draft 'wrap-prefix) "")
+                                        (or (overlay-get draft 'after-string) "")))))
+          (should (equal "  " (overlay-get draft 'line-prefix)))))
+      (delete-region prompt-end (point-max))
+      (should (= 1 (length (agent-shell-chat-mode-tests--me-overlays)))))))
+
+(ert-deftest agent-shell-chat-first-me-heading-submitted-parity-test ()
+  "A submitted first turn renders like later submitted turns.
+
+One `Me' heading on its own row directly above the input, whose rows
+carry the body indent; no marker survives submission, and no blank row
+sits between the heading and the body."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "line one\nline two\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "first reply\n\n")
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (insert "second turn\n")
+    (agent-shell-chat-mode-tests--marker)
+    (insert "second reply\n\n")
+    (agent-shell-chat--relabel)
+    (let* ((mes (agent-shell-chat-mode-tests--me-overlays))
+           (first (car mes))
+           (later (cadr mes))
+           (inputs (sort (seq-filter (lambda (overlay)
+                                       (eq (overlay-get overlay 'agent-shell-chat--tag)
+                                           'me-input))
+                                     (overlays-in (point-min) (point-max)))
+                         (lambda (a b) (< (overlay-start a) (overlay-start b))))))
+      (should (= 2 (length mes)))
+      ;; First: the heading leads the buffer on its own row, marker gone.
+      (should (string-match "\\` Me \n"
+                            (or (overlay-get first 'before-string) "")))
+      (should-not (string-match-p
+                   "❯" (concat (or (overlay-get first 'before-string) "")
+                               (or (overlay-get first 'display) ""))))
+      ;; Later: one blank line above its heading, closing the reply.
+      (should (string-match "\\`\n Me \n"
+                            (agent-shell-chat-mode-tests--label-string later)))
+      ;; Both turns' inputs align through the same body indent.
+      (should (equal '("  " "  ")
+                     (mapcar (lambda (overlay)
+                               (overlay-get overlay 'line-prefix))
+                             inputs)))
+      (should (equal '("  " "  ")
+                     (mapcar (lambda (overlay)
+                               (overlay-get overlay 'wrap-prefix))
+                             inputs))))))
+
+(ert-deftest agent-shell-chat-first-me-heading-event-lifecycle-test ()
+  "Enabling chat mode, a submission and an empty reprint keep one heading.
+
+Each transition goes through the real hooks: `agent-shell-chat--enable'
+backfills, and the coalesced scheduled relabel (flushed by waiting,
+never by relabeling by hand) covers the reprint.  A submission leaves
+one heading for the submitted turn and one for the fresh prompt."
+  (agent-shell-chat-mode-tests--with-shell
+    (setq major-mode 'agent-shell-mode)
+    ;; Subscribing stores into the state's :event-subscriptions, which
+    ;; needs a pre-existing (mutable, runtime-built) entry like the real
+    ;; `agent-shell--make-state' provides.
+    (setq agent-shell--state
+          (list (cons :agent-config '((:mode-line-name . "Claude")))
+                (cons :event-subscriptions nil)))
+    (setq agent-shell-chat--labeled nil)
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((live-beg (point-min)))
+      (unwind-protect
+          (progn
+            (agent-shell-chat--enable)
+            (should (= 1 (length (agent-shell-chat-mode-tests--me-overlays))))
+            ;; A submission: input, terminator, marker, response, new prompt.
+            (insert "hello\n")
+            (agent-shell-chat-mode-tests--marker)
+            (insert "reply\n\n")
+            (setq live-beg (point-max))
+            (agent-shell-chat-mode-tests--prompt "Claude> ")
+            (agent-shell-chat--schedule-relabel)
+            (sit-for 0.01)
+            (let ((mes (agent-shell-chat-mode-tests--me-overlays)))
+              (should (= 2 (length mes)))
+              (should (string-match "\\` Me \n"
+                                    (or (overlay-get (car mes) 'before-string) ""))))
+            ;; An empty submission: the live prompt goes stale (its face
+            ;; is stripped) and a fresh prompt is reprinted above it.
+            (remove-text-properties live-beg (point-max) '(font-lock-face nil))
+            (agent-shell-chat-mode-tests--prompt "Claude> ")
+            (agent-shell-chat--schedule-relabel)
+            (sit-for 0.01)
+            (let* ((mes (agent-shell-chat-mode-tests--me-overlays))
+                   (live (car (last mes))))
+              (should (= 2 (length mes)))
+              (should (string-match-p "Me"
+                                      (agent-shell-chat-mode-tests--label-string live)))
+              (should (string-match-p "❯"
+                                      (agent-shell-chat-mode-tests--marker-string live)))))
+        (ignore-errors (agent-shell-chat--disable))))))
+
+(ert-deftest agent-shell-chat-first-me-heading-relabel-idempotent-test ()
+  "Repeated relabels of a first prompt never stack headings."
+  (agent-shell-chat-mode-tests--with-shell
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((agent-shell-prompt-bar-mode nil))
+      (dotimes (_ 3)
+        (agent-shell-chat--relabel)
+        (should (= 1 (length (agent-shell-chat-mode-tests--me-overlays))))
+        (should (string-match "\\` Me \n"
+                              (or (overlay-get
+                                   (car (agent-shell-chat-mode-tests--me-overlays))
+                                   'before-string)
+                                  "")))))))
 
 (ert-deftest agent-shell-chat-overlays-carry-no-category-test ()
   "Chat overlays name themselves with their own property, never `category'.

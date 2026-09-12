@@ -416,12 +416,14 @@ Input is bounded by the next prompt, not just the
 starts): `Me' shows the instant a prompt is submitted, and an empty
 prompt does not claim the fresh prompt below as its input.
 
-Blank lines around the prompt collapse to exactly one on each side.  The
-label rides the one above rather than covering it, so that nothing is
-shown at the prompt itself, and the marker travels as a `line-prefix':
-a string standing at the prompt holds point and the cursor on the row
-above, putting the first line of a multi-line input out of reach of
-`previous-line'.  Updates in place."
+Blank lines around the prompt collapse to exactly one on each side,
+unless the prompt leads the buffer (a fresh or cleared shell): then no
+blank line is added above the label, imitating a turn that is not
+there.  The label rides the one above rather than covering it, so that
+nothing is shown at the prompt itself, and the marker travels as a
+`line-prefix': a string standing at the prompt holds point and the
+cursor on the row above, putting the first line of a multi-line input
+out of reach of `previous-line'.  Updates in place."
   (save-excursion
     (let ((runs (agent-shell-chat--prompt-runs))
           (prev-end nil)
@@ -471,6 +473,9 @@ above, putting the first line of a multi-line input out of reach of
                (after-panel (and (> raw-start (point-min))
                                  (agent-shell-chat--extends-bg-p
                                   (get-text-property (1- raw-start) 'face))))
+               ;; The prompt leads the buffer (a fresh or cleared shell):
+               ;; nothing sits above it to separate the label from.
+               (buffer-start (= raw-start (point-min)))
                ;; After response body (the normal case) keep that content's
                ;; line terminator visible: hiding it would merge the last
                ;; output line into the label for line motion (e.g.
@@ -525,6 +530,9 @@ above, putting the first line of a multi-line input out of reach of
                       ;; Terminator kept visible: it ends the content line, so
                       ;; one newline adds the single blank line.
                       (keep-term (propertize "\n" 'face 'default))
+                      ;; Nothing above to separate the label from, so no
+                      ;; blank line imitating a preceding turn either.
+                      (buffer-start "")
                       (t pad)))
                ;; Whether this run is labeled at all: an empty submission
                ;; carries no `Me', and the prompt bar takes the live prompt
@@ -561,6 +569,14 @@ above, putting the first line of a multi-line input out of reach of
                              (label-nl (concat lead me-label
                                                (propertize "\n" 'face
                                                            'default)))
+                             ;; Leading the buffer, the label takes the
+                             ;; first row on its own, closed by its own
+                             ;; newline: no pad above it and none between
+                             ;; it and the input, exactly the spacing a
+                             ;; later turn's label carries.
+                             (buffer-start (concat me-label
+                                                   (propertize "\n" 'face
+                                                               'default)))
                              (t (concat lead me-label pad)))))
           ;; Collapse whatever blank lines precede the one the label rides.
           (when (and label-nl (> label-nl start))
@@ -606,9 +622,9 @@ above, putting the first line of a multi-line input out of reach of
             ;; only ever applies to a submitted turn, and still drops any
             ;; tinted gutter inherited from the covered text.
             ;;
-            ;; With no newline above, the label renders here instead and each
-            ;; of its blank lines becomes a row of this line.  The marker
-            ;; rejoins the label, and no prefix is set at all: either would
+            ;; With no newline above, the label renders here instead, closed
+            ;; by its own newline onto its own row, and the marker joins the
+            ;; input's row below it.  No prefix is set at all: either would
             ;; repeat down every row, marking or indenting the label along
             ;; with the input.
             :props (list (cons 'before-string
