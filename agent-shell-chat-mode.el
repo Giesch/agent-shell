@@ -166,6 +166,23 @@ so a label following it needs a full pad rather than a single newline."
     (or (= beg (point-min))
         (eq (char-before beg) ?\n))))
 
+(defun agent-shell-chat--nothing-shown-before-p (pos)
+  "Return non-nil when nothing is displayed before POS.
+
+Only blank or invisible text precedes it.  A fresh shell whose welcome
+message is off opens with blank lines and an invisible failed-command
+marker before its first prompt; a cleared shell with nothing at all.
+
+For example, over \"\\n\\nClaude> \" returns non-nil at the prompt, and
+over \"reply\\n\\nClaude> \" returns nil."
+  (save-excursion
+    (goto-char (point-min))
+    (while (and (< (point) pos)
+                (or (memq (char-after) '(?\s ?\t ?\n))
+                    (invisible-p (point))))
+      (forward-char 1))
+    (= (point) pos)))
+
 (cl-defun agent-shell-chat--ensure-overlay (&key tag beg end props rear-advance
                                                  (anchor-beg beg)
                                                  (anchor-end end))
@@ -246,7 +263,13 @@ returns \"Me\\n\\nhi\"."
             (when-let* ((before (and overlay (overlay-get overlay 'before-string))))
               (push before pieces))
             (cond ((stringp display)
-                   (push display pieces)
+                   ;; A leading submitted turn uses `display' for the same
+                   ;; layout-only indent later turns carry in `line-prefix'.
+                   ;; Neither belongs in copied text.  Live prompt markers and
+                   ;; ordinary replacements still do.
+                   (unless (overlay-get overlay
+                                        'agent-shell-chat--display-layout-only)
+                     (push display pieces))
                    ;; Skip what the display stands in for, inner overlays
                    ;; included.  `next' guarantees progress on an empty overlay.
                    (setq pos (max next (min end (overlay-end overlay)))))
@@ -416,12 +439,19 @@ Input is bounded by the next prompt, not just the
 starts): `Me' shows the instant a prompt is submitted, and an empty
 prompt does not claim the fresh prompt below as its input.
 
-Blank lines around the prompt collapse to exactly one on each side.  The
-label rides the one above rather than covering it, so that nothing is
-shown at the prompt itself, and the marker travels as a `line-prefix':
-a string standing at the prompt holds point and the cursor on the row
-above, putting the first line of a multi-line input out of reach of
-`previous-line'.  Updates in place."
+Blank lines around the prompt collapse to exactly one on each side.  A
+later label rides the visible newline above its prompt, leaving only the
+single-row marker at the prompt itself so the input's first line remains
+reachable by `previous-line'.
+
+A prompt with nothing shown above it (a fresh shell with its welcome
+message off, or a cleared one) has no visible newline to ride.  Its label
+therefore stands in a `before-string' at the prompt, while the marker (or
+a submitted turn's indent) is the prompt's single-row `display'.  The
+overlay reaches back over blank and invisible preamble text so no empty
+rows show above the label.  Keeping the multi-row label out of `display'
+is essential: point in covered prompt text would otherwise draw its
+cursor on the label row.  Updates in place."
   (save-excursion
     (let ((runs (agent-shell-chat--prompt-runs))
           (prev-end nil)
@@ -446,6 +476,14 @@ above, putting the first line of a multi-line input out of reach of
                ;; prompt and no end-of-prompt marker follow it.  (A submitted
                ;; turn awaiting its reprinted prompt is last but has a marker.)
                (live (and (null next-pos) (null marker-pos)))
+               ;; Nothing shows above the prompt: a fresh shell with its
+               ;; welcome message off opens with blank lines and an
+               ;; invisible failed-command marker, a cleared one with
+               ;; nothing at all.  No newline above can carry the label
+               ;; (an invisible one is skipped along with its strings),
+               ;; so the prompt's own overlay draws it.
+               (leading (and (null prev-end)
+                             (agent-shell-chat--nothing-shown-before-p pos)))
                (raw-start (save-excursion
                             (goto-char pos)
                             (skip-chars-backward " \t\n")
@@ -485,7 +523,12 @@ above, putting the first line of a multi-line input out of reach of
                                ;; ending the line instead of separating it,
                                ;; butting the label against the content.
                                (not (get-char-property raw-start 'invisible))))
-               (start (if keep-term (1+ raw-start) raw-start))
+               ;; A leading prompt's overlay reaches back to the start of the
+               ;; buffer, taking the blank lines and invisible marker above
+               ;; it under the label rather than leaving them as blank rows.
+               (start (cond (leading (point-min))
+                            (keep-term (1+ raw-start))
+                            (t raw-start)))
                ;; The live prompt keeps its in-progress input (never swallow
                ;; it); a submitted turn swallows the input's leading blank lines.
                (end (if (or blank live) run-end
@@ -503,6 +546,11 @@ above, putting the first line of a multi-line input out of reach of
                ;; renders one blank line when `start' is mid-line after content.
                ;; Several cases need fewer, to keep it at exactly one:
                (lead (cond
+                      ;; Nothing above to separate the label from, so no
+                      ;; blank line either.  A hidden leading run hands this
+                      ;; on to the label below it, which then opens the
+                      ;; buffer the same way.
+                      (leading "")
                       ;; Directly stacked on the previous prompt run (empty
                       ;; submissions in a row).  That run is hidden (an empty
                       ;; submission is unlabeled), so it emitted no pad to
@@ -540,7 +588,9 @@ above, putting the first line of a multi-line input out of reach of
                ;; at the prompt itself: a `before-string' there holds point and
                ;; cursor on the row above, putting a multi-line input's first
                ;; line out of reach of `previous-line'.
-               (label-nl (and labeled (< start pos) (eq (char-before pos) ?\n)
+               ;; A leading prompt has no shown newline to ride.
+               (label-nl (and labeled (not leading)
+                              (< start pos) (eq (char-before pos) ?\n)
                               (1- pos)))
                ;; The live prompt's marker, shown before the input whether or
                ;; not text has been typed yet.  Keying this off `blank' would
@@ -556,12 +606,23 @@ above, putting the first line of a multi-line input out of reach of
                                  agent-shell-chat--body-indent
                                ""))
                ;; The label, closed by the newline it rides rather than by the
-               ;; second half of `pad'.
+               ;; second half of `pad'.  A leading prompt has no newline to
+               ;; ride, so its label stands before the covered prompt and
+               ;; the pad closes it: the label, then one blank line, as a
+               ;; later turn shows.
                (before (cond ((not labeled) "")
                              (label-nl (concat lead me-label
                                                (propertize "\n" 'face
                                                            'default)))
-                             (t (concat lead me-label pad)))))
+                             (t (concat lead me-label pad))))
+               ;; A submitted leading turn's input shares the covered
+               ;; prompt's row.  A `line-prefix' there would indent the
+               ;; label's rows too (a prefix repeats down every row of the
+               ;; line), so the indent stands in for the covered prompt
+               ;; instead, where the live prompt shows its marker.
+               (leading-indent (when (and leading labeled (not marker))
+                                 (propertize agent-shell-chat--body-indent
+                                             'face 'default))))
           ;; Collapse whatever blank lines precede the one the label rides.
           (when (and label-nl (> label-nl start))
             (push
@@ -606,14 +667,28 @@ above, putting the first line of a multi-line input out of reach of
             ;; only ever applies to a submitted turn, and still drops any
             ;; tinted gutter inherited from the covered text.
             ;;
-            ;; With no newline above, the label renders here instead and each
-            ;; of its blank lines becomes a row of this line.  The marker
-            ;; rejoins the label, and no prefix is set at all: either would
-            ;; repeat down every row, marking or indenting the label along
-            ;; with the input.
+            ;; With nothing shown above, the label stands here as the
+            ;; `before-string', and the marker (or a submitted turn's
+            ;; indent) is the `display' on the prompt's own positions.
+            ;; Point anywhere in the covered prompt then shows its cursor
+            ;; where those strings end, on the input's row.  A multi-row
+            ;; `display' carrying the label would draw it on the label's
+            ;; row instead: a `cursor' property on such a string picks a
+            ;; glyph within a row, not the row.  No prefix is set at all:
+            ;; either would repeat down every row, marking or indenting
+            ;; the label along with the input.
             :props (list (cons 'before-string
-                               (if label-nl "" (concat before (or marker ""))))
-                         (cons 'display (if label-nl (or marker "") ""))
+                               (cond (label-nl "")
+                                     (leading before)
+                                     (t (concat before (or marker "")))))
+                         (cons 'display (cond (leading (or marker leading-indent ""))
+                                              (label-nl (or marker ""))
+                                              (t "")))
+                         ;; The submitted leading indent is equivalent to a
+                         ;; line prefix, but cannot be one without shifting the
+                         ;; label rows.  Tell rendered-copy readers to omit it.
+                         (cons 'agent-shell-chat--display-layout-only
+                               (and leading-indent t))
                          (cons 'line-prefix
                                (if (and label-nl (not marker)) input-indent ""))
                          (cons 'wrap-prefix (if label-nl input-indent ""))))

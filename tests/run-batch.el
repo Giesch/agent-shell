@@ -96,7 +96,12 @@ every tests/*-tests.el file, and runs `ert-run-tests-batch'.  SELECTOR
 defaults to \"^agent-shell\".  Returns a summary string with total,
 completed, unexpected, and skipped counts plus symbol provenance."
   (interactive)
-  (let* ((root (or root
+  ;; Loading and failure reporting can both visit source files.  Disable
+  ;; local-variable processing for the whole operation so an unattended
+  ;; `emacsclient' run cannot stop at a directory-local safety prompt.
+  (let* ((enable-local-variables nil)
+         (enable-dir-local-variables nil)
+         (root (or root
                    (expand-file-name ".." (file-name-directory
                                            (or load-file-name
                                                buffer-file-name
@@ -108,11 +113,7 @@ completed, unexpected, and skipped counts plus symbol provenance."
                                            t "-tests\\.el\\'")
                           #'string<))
         (load file nil t))
-      ;; Failure reporting visits test files for source locations; a
-      ;; dir-locals prompt there would hang a frameless daemon.
-      (let* ((enable-local-variables nil)
-             (enable-dir-local-variables nil)
-             (stats (ert-run-tests-batch selector))
+      (let* ((stats (ert-run-tests-batch selector))
              (tests (ert--stats-tests stats))
              (results (mapcar #'ert-test-most-recent-result tests))
              (pairs (seq-mapn #'cons tests results)))
