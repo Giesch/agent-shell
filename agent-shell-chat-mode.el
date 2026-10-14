@@ -41,8 +41,8 @@
 
 (require 'map)
 (require 'seq)
+(require 'cl-lib)
 (eval-when-compile
-  (require 'cl-lib)
   (require 'subr-x))
 
 (defvar agent-shell-prompt-queue-setup-minibuffer-functions)
@@ -112,6 +112,76 @@ to the background); `:box' t adds a border in the foreground color."
 
 (defvar-local agent-shell-chat--last-prompt-end nil
   "End position of `comint-last-prompt' at the last scheduled relabel, or nil.")
+
+;;; Scrolling
+
+(defun agent-shell-chat--scroll-header-at (position)
+  "Return a multiline chat header overlay beginning at POSITION, if any."
+  (seq-find
+   (lambda (overlay)
+     (and (= (overlay-start overlay) position)
+          (memq (overlay-get overlay 'agent-shell-chat--tag)
+                '(me me-label agent))
+          (let ((before (overlay-get overlay 'before-string)))
+            (and (stringp before) (string-match-p "\n" before)))))
+   (overlays-at position)))
+
+(defun agent-shell-chat--scroll-advice (original count direction)
+  "Call ORIGINAL with COUNT, crossing a chat header if one-line scrolling stalls.
+
+Multiline `before-string' rows have one buffer position.  On graphical
+frames, `scroll-up' and `scroll-down' can stop at that position when asked
+to move one line.  Retry once with enough lines to cross the header.  Keep
+the advice installed globally with a cheap mode guard: multiple shell
+buffers and killed buffers then require no shared lifecycle bookkeeping."
+  (let* ((window (selected-window))
+         (buffer (window-buffer window)))
+    (if (not (and (numberp count) (= (abs count) 1)
+                  (buffer-live-p buffer)
+                  (with-current-buffer buffer agent-shell-chat-mode)))
+        (funcall original count)
+      (let ((before-start (window-start window))
+            (before-vscroll (window-vscroll window t))
+            (boundary-error nil)
+            (result nil))
+        (condition-case err
+            (setq result (funcall original count))
+          ((beginning-of-buffer end-of-buffer)
+           (setq boundary-error err)))
+        (when (and (= before-start (window-start window))
+                   (= before-vscroll (window-vscroll window t)))
+          (with-current-buffer buffer
+            (let* ((position (window-start window))
+                   (forward (> (* direction count) 0))
+                   (header (or (agent-shell-chat--scroll-header-at position)
+                               (and (not forward) (> position (point-min))
+                                    (seq-some
+                                     (lambda (overlay)
+                                       (and (= (overlay-end overlay) position)
+                                            (agent-shell-chat--scroll-header-at
+                                             (overlay-start overlay))))
+                                     (overlays-at (1- position)))))))
+              (when (and header
+                         (if forward (< (overlay-end header) (point-max))
+                           (> (overlay-start header) (point-min))))
+                (let ((retry (* count
+                                (1+ (cl-count ?\n (overlay-get header 'before-string))))))
+                  (condition-case nil
+                      (funcall original retry)
+                    ((beginning-of-buffer end-of-buffer) nil)))))))
+        (when (and boundary-error
+                   (= before-start (window-start window))
+                   (= before-vscroll (window-vscroll window t)))
+          (signal (car boundary-error) (cdr boundary-error)))
+        result))))
+
+(defun agent-shell-chat--scroll-up-advice (original &optional count)
+  "Call ORIGINAL `scroll-up' with COUNT, recovering from chat header stalls."
+  (agent-shell-chat--scroll-advice original count 1))
+
+(defun agent-shell-chat--scroll-down-advice (original &optional count)
+  "Call ORIGINAL `scroll-down' with COUNT, recovering from chat header stalls."
+  (agent-shell-chat--scroll-advice original count -1))
 
 ;;; Labels
 
@@ -1036,6 +1106,20 @@ Enable it for new shells by default with `agent-shell-chat-mode-enabled'."
       ;; reports itself rather than taking the load down with it.
       (with-demoted-errors "agent-shell-chat: %S"
         (agent-shell-chat--relabel)))))
+
+;; Evil calls these functions directly, so command remapping cannot see the
+;; one-line scrolls.  Both advices pass through to the original operation
+;; immediately in other buffers.
+(unless (advice-member-p #'agent-shell-chat--scroll-up-advice 'scroll-up)
+  (advice-add 'scroll-up :around #'agent-shell-chat--scroll-up-advice))
+(unless (advice-member-p #'agent-shell-chat--scroll-down-advice 'scroll-down)
+  (advice-add 'scroll-down :around #'agent-shell-chat--scroll-down-advice))
+
+(defun agent-shell-chat-mode-unload-function ()
+  "Remove scroll advice when `agent-shell-chat-mode' is unloaded."
+  (advice-remove 'scroll-up #'agent-shell-chat--scroll-up-advice)
+  (advice-remove 'scroll-down #'agent-shell-chat--scroll-down-advice)
+  nil)
 
 (provide 'agent-shell-chat-mode)
 

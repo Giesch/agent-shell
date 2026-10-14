@@ -1291,7 +1291,7 @@ row."
           (should (= input-row landed-row)))))))
 
 (ert-deftest agent-shell-chat-leading-prompt-wrapped-first-line-reachable-test ()
-  "`vertical-motion' reaches the first row of a wrapped leading input.
+  "`previous-line' reaches the first row of a wrapped leading input.
 
 A long first logical line wraps.  Moving up from its continuation row
 must remain inside the input and reach its first visual row, never jump
@@ -1310,9 +1310,12 @@ into covered preamble text or the label row."
                (input-row (cdr (posn-col-row (posn-at-point input window))))
                (continuation-row
                 (cdr (posn-col-row (posn-at-point continuation window))))
-               (landed (progn
+               (landed (with-selected-window window
                          (goto-char continuation)
-                         (vertical-motion -1 window)
+                         (let ((line-move-visual t)
+                               (last-command nil)
+                               (goal-column nil))
+                           (previous-line 1))
                          (point)))
                (landed-row
                 (cdr (posn-col-row (posn-at-point landed window)))))
@@ -1320,6 +1323,99 @@ into covered preamble text or the label row."
           (should (<= input landed))
           (should (< landed continuation))
           (should (= input-row landed-row)))))))
+
+(ert-deftest agent-shell-chat-scroll-advice-guards-test ()
+  "Retry only a stalled one-line scroll at a tagged chat header."
+  (save-window-excursion
+    (with-temp-buffer
+      (insert "header\nbody\nmore\n")
+      (switch-to-buffer (current-buffer))
+      (goto-char (point-min))
+      (set-window-start (selected-window) (point-min))
+      (let ((overlay (make-overlay (point-min) (1+ (point-min))))
+            (calls nil))
+        (overlay-put overlay 'agent-shell-chat--tag 'me)
+        (overlay-put overlay 'before-string "Me\n\n")
+        (setq-local agent-shell-chat-mode t)
+        (let ((original (lambda (count) (push count calls) 'original-result)))
+          (should (eq (agent-shell-chat--scroll-advice original 1 1)
+                      'original-result))
+          (should (equal (nreverse calls) '(1 3)))
+          (setq calls nil)
+          (agent-shell-chat--scroll-advice original 0 1)
+          (should (equal calls '(0)))
+          (setq calls nil)
+          (agent-shell-chat--scroll-advice original 4 1)
+          (should (equal calls '(4)))
+          (setq calls nil)
+          (agent-shell-chat--scroll-advice original -1 -1)
+          (should (equal (nreverse calls) '(-1 -3)))
+          (setq calls nil)
+          (setq-local agent-shell-chat-mode nil)
+          (agent-shell-chat--scroll-advice original 1 1)
+          (should (equal calls '(1)))
+          (setq-local agent-shell-chat-mode t)
+          (should-error
+           (agent-shell-chat--scroll-advice
+            (lambda (_count) (signal 'beginning-of-buffer nil)) 1 -1)
+           :type 'beginning-of-buffer))))))
+
+(ert-deftest agent-shell-chat-one-line-scroll-crosses-headers-test ()
+  "Repeated graphical one-line scrolls cross every rendered turn header."
+  (skip-unless (seq-some #'display-graphic-p (frame-list)))
+  (with-selected-frame (seq-find #'display-graphic-p (frame-list))
+    (agent-shell-chat-mode-tests--with-shell
+      (setq-local agent-shell-chat-mode t)
+      (dotimes (_ 3)
+        (agent-shell-chat-mode-tests--prompt "Claude> ")
+        (insert "question\n")
+        (agent-shell-chat-mode-tests--marker)
+        (dotimes (line 24)
+          (insert (format "response line %d\n" line)))
+        (insert "\n\n"))
+      (agent-shell-chat--relabel)
+      (let ((original-text (buffer-string))
+            (reverse-headers
+             (seq-filter (lambda (overlay)
+                           (and (> (overlay-start overlay) (point-min))
+                                (memq (overlay-get overlay 'agent-shell-chat--tag)
+                                      '(me-label agent))))
+                         (overlays-in (point-min) (point-max))))
+            (last-header (apply #'max
+                                (mapcar #'overlay-start
+                                        (agent-shell-chat-mode-tests--agent-overlays)))))
+        (agent-shell-chat-mode-tests--with-frame window
+          (with-selected-window window
+            (goto-char (point-min))
+            (set-window-start window (point-min))
+            (redisplay t)
+            (let ((stalled 0)
+                  (steps 0)
+                  (previous (cons (window-start window)
+                                  (window-vscroll window t))))
+              (while (and (<= (window-start window) last-header)
+                          (< steps 250) (< stalled 8))
+                (scroll-up 1)
+                (redisplay t)
+                (let ((now (cons (window-start window)
+                                 (window-vscroll window t))))
+                  (setq stalled (if (equal now previous) (1+ stalled) 0)
+                        previous now
+                        steps (1+ steps))))
+              (should (< stalled 8))
+              (should (> (window-start window) last-header))
+              (should (pos-visible-in-window-p (point) window))
+              (dolist (header reverse-headers)
+                (goto-char (overlay-start header))
+                (set-window-start window (overlay-start header))
+                (redisplay t)
+                (let ((start (window-start window)))
+                  (should (= start (overlay-start header)))
+                  (scroll-down 1)
+                  (redisplay t)
+                  (should (< (window-start window) start))
+                  (should (pos-visible-in-window-p (point) window))))
+              (should (equal (buffer-string) original-text)))))))))
 
 (provide 'agent-shell-chat-mode-tests)
 ;;; agent-shell-chat-mode-tests.el ends here
