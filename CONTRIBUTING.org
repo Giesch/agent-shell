@@ -247,3 +247,27 @@ Tests live under the tests directory:
 Opening any file under the =tests= directory will load the =agent-shell-run-all-tests= command.
 
 Run tests with =M-x agent-shell-run-all-tests=.
+
+*** Isolated local testing for the Giesch fork
+
+For an isolated run, use a dedicated non-Doom server and the non-exiting
+runner.  Replace =SOCKET= with that server's name and =ROOT= with the
+absolute checkout directory:
+
+#+begin_src bash
+  emacsclient -s SOCKET --eval '(load "ROOT/tests/run-batch.el" nil t)'
+  emacsclient -s SOCKET --eval '(agent-shell-tests-run-batch "ROOT")'
+#+end_src
+
+The runner explicitly loads candidate sources, checks their provenance, and
+reports =TOTAL=, =COMPLETED=, =UNEXPECTED=, and =SKIPPED= counts.  Dependencies
+are discovered in sibling checkouts or on =load-path=; a clean server may
+need the dependency library directories added to =load-path= first.  Require
+=COMPLETED= to equal =TOTAL= and investigate unexpected results and skips.
+Some graphical tests skip when no graphical frame is available.
+
+Native submit transport, first-message clear/history, and elicitation form
+regressions belong in =tests/agent-shell-transport-tests.el= and
+=tests/agent-shell-elicitation-tests.el=.  These suites run without Doom or
+Evil.  Configuration-specific key remapping tests belong with the
+configuration that defines those mappings.

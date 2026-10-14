@@ -16,19 +16,22 @@
                    (multi . ((type . "array") (items . ((anyOf . [((const . "A")) ((const . "B"))]))))))))
   "A required text question and optional choices.")
 
-(defun agent-shell-elicitation-tests--call (schema function &optional native-request)
+(defun agent-shell-elicitation-tests--call (schema function &optional native-request traffic-file)
   "Render SCHEMA through fake process dispatch and call FUNCTION with state.
 
-NATIVE-REQUEST optionally supplies the exact incoming request envelope."
+NATIVE-REQUEST optionally supplies the exact incoming request envelope.
+TRAFFIC-FILE defaults to the single-select fixture.  A nil SCHEMA preserves
+its recorded schema."
   (let* ((messages (acp-traffic-read-file
-                    (expand-file-name "elicitation-single-select.traffic"
+                    (expand-file-name (or traffic-file "elicitation-single-select.traffic")
                                       (file-name-directory (symbol-file 'agent-shell-fakes-start-agent)))))
          (request (seq-find (lambda (message)
                               (equal (map-nested-elt message '(:object method)) "elicitation/create")) messages))
          buffer client)
     (when native-request (setf (map-elt request :object) (copy-tree native-request t)))
-    (let ((params (map-nested-elt request '(:object params))))
-      (setf (map-elt params 'requestedSchema) (copy-tree schema t)))
+    (when schema
+      (let ((params (map-nested-elt request '(:object params))))
+        (setf (map-elt params 'requestedSchema) (copy-tree schema t))))
     (save-window-excursion
       (unwind-protect
           (progn
@@ -152,7 +155,9 @@ NATIVE-REQUEST optionally supplies the exact incoming request envelope."
      (let* ((client (map-elt state :client))
             (record (map-nested-elt state '(:elicitations 101)))
             (submit (agent-shell-elicitation-tests--button "Submit"))
-            (edit (agent-shell-elicitation-tests--button "Edit")))
+            (edit (agent-shell-elicitation-tests--button "Edit"))
+            (control-return (agent-shell-elicitation-tests--button "Edit" "C-<return>"))
+            (prompt-count (length (agent-shell-elicitation-tests--prompts client))))
        (agent-shell-elicitation-tests--cancel state "101")
        (should (map-nested-elt state '(:elicitations 101)))
        (cl-letf (((symbol-function 'read-string)
@@ -160,6 +165,10 @@ NATIVE-REQUEST optionally supplies the exact incoming request envelope."
          (funcall edit))
        (funcall submit)
        (funcall edit)
+       (should (commandp control-return))
+       (call-interactively control-return)
+       (agent-shell-fakes--settle)
+       (should (= prompt-count (length (agent-shell-elicitation-tests--prompts client))))
        (agent-shell-elicitation-tests--cancel state 101)
        (should-not (map-elt record :answers))
        (should-not (map-elt state :elicitations))
@@ -464,6 +473,127 @@ MODE selects option, other, or text entry.  Values are synthetic."
        (should (= -32603 (map-nested-elt (car responses) '(:error code))))
        (should-not (string-search "PRIVATE_EDITOR_ERROR" (format "%S" responses))))
      (should-not (map-elt state :elicitations)))))
+
+(defun agent-shell-elicitation-tests--prompts (client)
+  "Return CLIENT's sent shell prompts."
+  (seq-filter (lambda (request) (equal (map-elt request :method) "session/prompt"))
+              (acp-fakes-sent-requests client)))
+
+(defun agent-shell-elicitation-tests--result (state content)
+  "Check that STATE sent exactly one accepted response with CONTENT."
+  (agent-shell-fakes--settle)
+  (let ((responses (acp-fakes-sent-responses (map-elt state :client))))
+    (should (= 1 (length responses)))
+    (should (equal "accept" (map-nested-elt (car responses) '(:result action))))
+    (should (equal content (map-nested-elt (car responses) '(:result content)))))
+  (should (= 1 (length (agent-shell-elicitation-tests--prompts (map-elt state :client))))))
+
+(ert-deftest agent-shell-elicitation-form-initial-focus-test ()
+  "Focus the first option of the pending question."
+  (agent-shell-elicitation-tests--call
+   nil
+   (lambda (_state)
+     (let ((focus (text-property-any (point-min) (point-max) 'agent-shell-button-focus t)))
+       (should focus)
+       (should (string-search "JWT" (buffer-substring-no-properties
+                                    (max (point-min) (- focus 20))
+                                    (min (point-max) (+ focus 20)))))))))
+
+(ert-deftest agent-shell-elicitation-form-selection-change-before-submit-test ()
+  "Change a selection before submitting its final wire value."
+  (agent-shell-elicitation-tests--call
+   nil
+   (lambda (state)
+     (funcall (agent-shell-elicitation-tests--button "Session" "2"))
+     (should-not (acp-fakes-sent-responses (map-elt state :client)))
+     (funcall (agent-shell-elicitation-tests--button "JWT" "1"))
+     (should-not (acp-fakes-sent-responses (map-elt state :client)))
+     (funcall (agent-shell-elicitation-tests--button "JWT" "c"))
+     (agent-shell-elicitation-tests--result state '((question_0 . "JWT"))))))
+
+(ert-deftest agent-shell-elicitation-form-multi-select-survives-edit-test ()
+  "Keep the remaining multi-select value after toggling another off."
+  (agent-shell-elicitation-tests--call
+   nil
+   (lambda (state)
+     (dolist (key '("1" "2" "1" "c"))
+       (funcall (agent-shell-elicitation-tests--button "Rendering" key)))
+     (agent-shell-elicitation-tests--result state '((question_0 . ["Rendering"]))))
+   nil "elicitation-multi-select.traffic"))
+
+(ert-deftest agent-shell-elicitation-form-other-text-survives-test ()
+  "Send the edited Other answer verbatim."
+  (agent-shell-elicitation-tests--call
+   nil
+   (lambda (state)
+     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "OAuth")))
+       (funcall (agent-shell-elicitation-tests--button "Other" "o")))
+     (should-not (acp-fakes-sent-responses (map-elt state :client)))
+     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "OpenID")))
+       (funcall (agent-shell-elicitation-tests--button "Other" "o")))
+     (funcall (agent-shell-elicitation-tests--button "Other" "c"))
+     (agent-shell-elicitation-tests--result state '((question_0_custom . "OpenID"))))))
+
+(ert-deftest agent-shell-elicitation-form-control-return-test ()
+  "Answer through the option's C-RET command without submitting the shell."
+  (agent-shell-elicitation-tests--call
+   nil
+   (lambda (state)
+     (let ((command (agent-shell-elicitation-tests--button "JWT" "C-<return>")))
+       (should (commandp command))
+       (should-not (eq command 'agent-shell-submit))
+       (call-interactively command))
+     (agent-shell-elicitation-tests--result state '((question_0 . "JWT"))))))
+
+(ert-deftest agent-shell-elicitation-form-skip-payload-test ()
+  "Decline once through Skip without another shell prompt."
+  (agent-shell-elicitation-tests--call
+   nil
+   (lambda (state)
+     (let ((client (map-elt state :client)))
+       (funcall (agent-shell-elicitation-tests--button "JWT" "s"))
+       (agent-shell-fakes--settle)
+       (should (= 1 (length (acp-fakes-sent-responses client))))
+       (should (equal "decline" (map-nested-elt (car (acp-fakes-sent-responses client)) '(:result action))))
+       (should (= 1 (length (agent-shell-elicitation-tests--prompts client))))))))
+
+(ert-deftest agent-shell-elicitation-required-text-control-return-test ()
+  "Validate and edit a standalone required field through C-RET."
+  (let (buffer client)
+    (save-window-excursion
+      (unwind-protect
+          (progn
+            (setq buffer
+                  (agent-shell-fakes-start-agent
+                   (acp-traffic-read-file
+                    (expand-file-name "elicitation-single-select.traffic"
+                                      (file-name-directory (symbol-file 'agent-shell-fakes-start-agent))))))
+            (agent-shell-fakes--settle)
+            (with-current-buffer buffer
+              (setq client (map-elt (agent-shell--state) :client))
+              (agent-shell--on-request
+               :state (agent-shell--state)
+               :acp-request '((id . 101) (method . "elicitation/create")
+                              (params . ((mode . "form") (message . "Name?")
+                                         (requestedSchema . ((type . "object") (required . ["name"])
+                                                             (properties . ((name . ((type . "string")))))))))))
+              (call-interactively (agent-shell-elicitation-tests--button "Submit" "C-<return>"))
+              (should-not (acp-fakes-sent-responses client))
+              (should (map-nested-elt (agent-shell--state) '(:elicitations 101 :validation)))
+              (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "Native text")))
+                (call-interactively (agent-shell-elicitation-tests--button "Edit" "C-<return>")))
+              (agent-shell-fakes--settle)
+              (should (= 1 (length (acp-fakes-sent-responses client))))
+              (should (equal "Native text" (map-nested-elt (car (acp-fakes-sent-responses client))
+                                                          '(:result content name))))
+              (should-not (agent-shell-elicitation-tests--prompts client))))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer (agent-shell--cancel-idle-timer))
+          (let ((kill-buffer-query-functions nil)) (kill-buffer buffer)))
+        (when client
+          (ignore-errors (acp-shutdown :client client))
+          (dolist (log (list (acp-traffic-buffer :client client) (acp-logs-buffer :client client)))
+            (when (buffer-live-p log) (kill-buffer log))))))))
 
 (provide 'agent-shell-elicitation-tests)
 ;;; agent-shell-elicitation-tests.el ends here
