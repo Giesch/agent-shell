@@ -207,7 +207,10 @@ notification follows the rejection."
                        client))
           (with-current-buffer buffer
             (goto-char (point-min))
-            (search-forward (concat "[ " button-label))
+            (let (found)
+              (while (and (not found) (search-forward button-label nil t))
+                (setq found (get-text-property (1- (point)) 'button)))
+              (should found))
             (let* ((keymap (get-text-property (1- (point)) 'keymap))
                    (command (lookup-key keymap
                                         (if key (kbd key) (kbd "RET")))))

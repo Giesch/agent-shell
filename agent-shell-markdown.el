@@ -59,6 +59,30 @@
 ;; Open / streaming fenced blocks (no closing fence yet) are
 ;; left alone so their contents stay protected as the buffer
 ;; grows.
+;;
+;; Why not `markdown-ts-mode'?
+;;
+;; Emacs 31 ships `markdown-ts-mode', which is built for editing:
+;; markdown source stays intact and markup is only hidden.  This
+;; package is optimized for rendering streamed output: markup is removed
+;; and rendered text is frozen as new output arrives.  Its rendering
+;; is opinionated and tuned for agent-shell, so it may not suit
+;; general markdown viewing.  As of Emacs 31.0.90, the difference
+;; shows up as:
+;;
+;;   streaming   It renders via font-lock, which may re-run over any
+;;               region.  Freezing rendered text behind a watermark
+;;               would have to be built on top of it.
+;;   copying     Markup is hidden with `invisible' / `display', so
+;;               copied text keeps `**', `- ', `![alt](url)', etc.
+;;   major mode  Shell buffers already have a major mode, with
+;;               markdown confined to regions between prompts and
+;;               tool calls.
+;;   tables      Pipe tables are aligned as source rather than drawn,
+;;               and parse inconsistently (ragged rows, empty cells).
+;;   versions    Needs Emacs 31.1 plus the `markdown' and
+;;               `markdown-inline' grammars.  agent-shell supports
+;;               Emacs 29.1.
 
 ;;; Code:
 
@@ -138,18 +162,37 @@
   "Face for level-6 headers rendered by `agent-shell-markdown-convert'."
   :group 'agent-shell-markdown)
 
+(defface agent-shell-markdown-table
+  '((t nil))
+  "Base face for every character of a rendered table.
+Carries no attributes of its own, so default rendering is unchanged.
+Plain data rows carry it directly, while
+`agent-shell-markdown-table-header' and
+`agent-shell-markdown-table-zebra' inherit it, listing it last so
+their own attributes still win.  `agent-shell-markdown-table-border'
+lists it first instead, see its docstring.  One face therefore covers
+a whole table, which is what face-remapping setups such as
+`mixed-pitch-mode' need to pin every column to the same font."
+  :group 'agent-shell-markdown)
+
 (defface agent-shell-markdown-table-header
-  '((t :inherit bold))
+  '((t :inherit (bold agent-shell-markdown-table)))
   "Face for table header row content."
   :group 'agent-shell-markdown)
 
 (defface agent-shell-markdown-table-border
-  '((t :inherit font-lock-comment-face))
-  "Face for table borders (pipes and dashes)."
+  '((t :inherit (agent-shell-markdown-table font-lock-comment-face)))
+  "Face for table borders (pipes and dashes).
+Inherits `agent-shell-markdown-table' first, so a font pinned through
+it wins over one a theme sets on `font-lock-comment-face', which
+supplies the colour.  Otherwise, with `agent-shell-markdown-table'
+remapped to `fixed-pitch', borders would render in the comment font
+while cells render in the fixed-pitch one, and a separator row of
+`─' would overshoot the columns below it."
   :group 'agent-shell-markdown)
 
 (defface agent-shell-markdown-table-zebra
-  '((t :inherit lazy-highlight))
+  '((t :inherit (lazy-highlight agent-shell-markdown-table)))
   "Face for alternating (zebra) data rows in tables."
   :group 'agent-shell-markdown)
 
@@ -287,13 +330,16 @@ at position 1200 returns:
 
   ((:watermark . 1200))")
 
-(cl-defun agent-shell-markdown-convert (markdown)
+(cl-defun agent-shell-markdown-convert (markdown &key tracking-file)
   "Convert MARKDOWN string into propertized text.
 
 Bold, italic, strikethrough, headers, and inline code are
 rendered as text properties on the inner text; the markup
 characters are removed.  See `agent-shell-markdown-replace-markup' for
 the in-buffer equivalent.
+
+TRACKING-FILE enables link tracking labels, recording opened links
+there (see `agent-shell-markdown-replace-markup').
 
 For example:
 
@@ -303,14 +349,15 @@ For example:
     (insert markdown)
     ;; A complete string, not a stream: force a final render so trailing
     ;; constructs (e.g. an image at end of buffer) aren't held back.
-    (agent-shell-markdown-replace-markup :force t)
+    (agent-shell-markdown-replace-markup :force t :tracking-file tracking-file)
     (buffer-string)))
 
 (cl-defun agent-shell-markdown-replace-markup (&key force
                                                     complete
                                                     (render-images t)
                                                     (highlight-blocks t)
-                                                    image-cache-directory)
+                                                    image-cache-directory
+                                                    tracking-file)
   "Replace Markdown markup in current buffer with propertized text.
 
 Rewrites the buffer in place: markup characters are removed and
@@ -348,8 +395,10 @@ Pass COMPLETE non-nil when no more text will be appended, so
 markup held back while it could still grow renders now: an image
 ending the text is otherwise left raw in case a `{width=...}'
 block is still streaming in (see
-`agent-shell-markdown--image-attributes-pending-p').  FORCE
-implies it.
+`agent-shell-markdown--image-attributes-pending-p'), and a list
+item or table row on the last line is left raw until its newline
+arrives.
+FORCE implies it.
 
 RENDER-IMAGES, when non-nil (the default), replaces `![alt](url)'
 markup with displayed images where the URL resolves to an image
@@ -360,7 +409,14 @@ left as text.  HIGHLIGHT-BLOCKS, when non-nil
 \(the default), runs the fenced-block body through the language's
 major-mode font-lock to colour keywords / strings / etc.; nil
 strips the fences and inserts the action label but leaves the
-body un-fontified."
+body un-fontified.
+
+TRACKING-FILE, when non-nil, enables link tracking labels: a link
+followed by a Pandoc-style `{tracking-label=\"(new)\"}' block shows
+\" (new)\" after its title until opened, and opening it records the
+link in TRACKING-FILE so the label is not shown again (see
+`agent-shell-markdown--track-link-open').  When nil (the default), the
+block is left as literal text."
   (save-excursion
     (when force
       (with-silent-modifications
@@ -416,9 +472,11 @@ body un-fontified."
                      (strike-changed (agent-shell-markdown--replace-strikethroughs
                                       :avoid-ranges avoid-ranges)))
                  (or italic-changed bold-changed strike-changed)))
-        (agent-shell-markdown--replace-headers :avoid-ranges avoid-ranges)
+        (agent-shell-markdown--replace-headers :avoid-ranges avoid-ranges
+                                             :complete (or force complete))
         (agent-shell-markdown--style-inline-code :avoid-ranges source-ranges)
-        (agent-shell-markdown--replace-links :avoid-ranges avoid-ranges)
+        (agent-shell-markdown--replace-links :avoid-ranges avoid-ranges
+                                             :tracking-file tracking-file)
         (when render-images
           (agent-shell-markdown--replace-images
            :avoid-ranges avoid-ranges
@@ -439,8 +497,10 @@ body un-fontified."
                         source-ranges rendered-ranges)
          :inline-ranges inline-ranges)
         (agent-shell-markdown--style-dividers :avoid-ranges avoid-ranges)
-        (agent-shell-markdown--style-blockquotes :avoid-ranges avoid-ranges)
-        (agent-shell-markdown--style-lists :avoid-ranges avoid-ranges)
+        (agent-shell-markdown--style-blockquotes :avoid-ranges avoid-ranges
+                                                :complete (or force complete))
+        (agent-shell-markdown--style-lists :avoid-ranges avoid-ranges
+                                           :complete (or force complete))
         (agent-shell-markdown--style-source-blocks
          :highlight-blocks highlight-blocks)
         ;; Tables run last so cell content has already been processed by
@@ -456,7 +516,8 @@ body un-fontified."
         ;; `--update-watermark'), so `--find-tables' under the narrow
         ;; always sees the existing `agent-shell-markdown-table-source'
         ;; needed to fold new rows in.
-        (agent-shell-markdown--style-tables :avoid-ranges source-ranges)
+        (agent-shell-markdown--style-tables :avoid-ranges source-ranges
+                                            :complete (or force complete))
         ;; Restore backslash-escaped chars from their placeholders now that
         ;; every styling pass has run, before faces are mirrored below.
         (agent-shell-markdown--decode-escapes)
@@ -674,13 +735,26 @@ bold `let vs let*', still stashing `**let vs let\\***' for copy."
                       (point) 'agent-shell-markdown-escaped nil (point-max))
                      (point-max))))))
 
+(rx-define agent-shell-markdown--emphasis-content (delimiters)
+  ;; Emphasis content: chars other than newline, backtick or
+  ;; DELIMITERS, or whole `code' spans, which may hold any of
+  ;; DELIMITERS since code spans bind tighter than emphasis.  The two
+  ;; branches are disjoint (only the second starts with a backtick), so
+  ;; a line full of backticks cannot backtrack exponentially.  A lone
+  ;; backtick matches neither, but the unclosed-backtick avoid-range
+  ;; would block the span anyway.
+  (or (not (any "\n`" delimiters))
+      (seq "`" (zero-or-more (not (any "\n`"))) "`")))
+
 (cl-defun agent-shell-markdown--replace-bolds (&key avoid-ranges)
   "Replace `**X**' / `__X__' spans in current buffer with bold X.
 
 Markup characters are deleted; remaining inner text carries face
 `agent-shell-markdown-bold' layered on top of any existing face
-properties.  Spans that fall inside any of AVOID-RANGES are left
-untouched.  Returns non-nil if at least one replacement was made.
+properties.  Spans that fall inside or reach into any of AVOID-RANGES
+are left untouched.  Returns non-nil if at least one replacement was
+made.  A delimiter inside a `code' span within X does not end the span,
+so \"**`let*` form**\" is bold.
 
 For example, the buffer \"hello **world**.\" becomes \"hello
 world.\" with face `agent-shell-markdown-bold' on \"world\"."
@@ -690,22 +764,31 @@ world.\" with face `agent-shell-markdown-bold' on \"world\"."
     (while (re-search-forward
             (rx (or line-start (syntax whitespace))
                 (group
-                 (or (seq "**" (group (one-or-more (not (any "\n*")))) "**")
-                     (seq "__" (group (one-or-more (not (any "\n_")))) "__")))
+                 (or (seq "**" (group (one-or-more
+                                       (agent-shell-markdown--emphasis-content "*")))
+                          "**")
+                     (seq "__" (group (one-or-more
+                                       (agent-shell-markdown--emphasis-content "_")))
+                          "__")))
                 (or (syntax punctuation) (syntax whitespace) line-end))
             nil t)
       (let* ((markup-start (match-beginning 1))
              (markup-end (match-end 1))
              (avoid (agent-shell-markdown-in-avoid-range-p
                      markup-start markup-end avoid-ranges)))
-        (if avoid
-            (goto-char (cdr avoid))
+        (cond
+         (avoid
+          (goto-char (cdr avoid)))
+         ((agent-shell-markdown--straddles-avoid-range-p
+           markup-start markup-end avoid-ranges)
+          (goto-char (1+ markup-start)))
+         (t
           (agent-shell-markdown--emphasize-span
            :markup-start markup-start :markup-end markup-end
            :content-start (or (match-beginning 2) (match-beginning 3))
            :content-end (or (match-end 2) (match-end 3))
            :face 'agent-shell-markdown-bold)
-          (setq changed t))))
+          (setq changed t)))))
     changed))
 
 (cl-defun agent-shell-markdown--replace-italics (&key avoid-ranges)
@@ -718,7 +801,11 @@ untouched.  Returns non-nil if at least one replacement was made.
 
 A `_X_' span must be followed by punctuation, whitespace, or a line
 end, so intraword underscores such as \"_hello_world\" are left as
-literal text rather than emphasized.
+literal text rather than emphasized.  X may not start or end with
+whitespace, so a lone delimiter like the one in \"a * b *\" stays
+literal, as in CommonMark.  Spans reaching into an AVOID-RANGES
+entry (e.g. ending on the `*' of \"* and `*`\") are left alone too,
+since code spans bind tighter than emphasis.
 
 For example, the buffer \"hello *world*.\" becomes \"hello
 world.\" with face `agent-shell-markdown-italic' on \"world\"."
@@ -727,23 +814,38 @@ world.\" with face `agent-shell-markdown-italic' on \"world\"."
     (goto-char (point-min))
     (while (re-search-forward
             (rx (or (seq (or bol (one-or-more (any "\n \t")))
-                         (group "*" (group (one-or-more (not (any "\n*")))) "*"))
+                         (group "*"
+                                (group (agent-shell-markdown--emphasis-content "\t *")
+                                       (optional (zero-or-more
+                                                  (agent-shell-markdown--emphasis-content "*"))
+                                                 (agent-shell-markdown--emphasis-content "\t *")))
+                                "*"))
                     (seq (or bol (one-or-more (any "\n \t")))
-                         (group "_" (group (one-or-more (not (any "\n_")))) "_")
+                         (group "_"
+                                (group (agent-shell-markdown--emphasis-content "\t _")
+                                       (optional (zero-or-more
+                                                  (agent-shell-markdown--emphasis-content "_"))
+                                                 (agent-shell-markdown--emphasis-content "\t _")))
+                                "_")
                          (or (syntax punctuation) (syntax whitespace) line-end))))
             nil t)
       (let* ((markup-start (or (match-beginning 1) (match-beginning 3)))
              (markup-end (or (match-end 1) (match-end 3)))
              (avoid (agent-shell-markdown-in-avoid-range-p
                      markup-start markup-end avoid-ranges)))
-        (if avoid
-            (goto-char (cdr avoid))
+        (cond
+         (avoid
+          (goto-char (cdr avoid)))
+         ((agent-shell-markdown--straddles-avoid-range-p
+           markup-start markup-end avoid-ranges)
+          (goto-char (1+ markup-start)))
+         (t
           (agent-shell-markdown--emphasize-span
            :markup-start markup-start :markup-end markup-end
            :content-start (or (match-beginning 2) (match-beginning 4))
            :content-end (or (match-end 2) (match-end 4))
            :face 'agent-shell-markdown-italic)
-          (setq changed t))))
+          (setq changed t)))))
     changed))
 
 (cl-defun agent-shell-markdown--replace-strikethroughs (&key avoid-ranges)
@@ -751,8 +853,8 @@ world.\" with face `agent-shell-markdown-italic' on \"world\"."
 
 Markup characters are deleted; remaining inner text carries face
 `agent-shell-markdown-strikethrough' layered on top of any existing face
-properties.  Spans inside any of AVOID-RANGES are left untouched.
-Returns non-nil if at least one replacement was made.
+properties.  Spans inside or reaching into any of AVOID-RANGES are
+left untouched.  Returns non-nil if at least one replacement was made.
 
 For example, the buffer \"a ~~b~~ c\" becomes \"a b c\" with face
 `agent-shell-markdown-strikethrough' on \"b\"."
@@ -760,22 +862,39 @@ For example, the buffer \"a ~~b~~ c\" becomes \"a b c\" with face
         (changed nil))
     (goto-char (point-min))
     (while (re-search-forward
-            (rx "~~" (group (one-or-more (not (any "\n~")))) "~~")
+            (rx "~~" (group (one-or-more
+                             (agent-shell-markdown--emphasis-content "~")))
+                "~~")
             nil t)
       (let* ((markup-start (match-beginning 0))
              (markup-end (match-end 0))
              (avoid (agent-shell-markdown-in-avoid-range-p
                      markup-start markup-end avoid-ranges)))
-        (if avoid
-            (goto-char (cdr avoid))
+        (cond
+         (avoid
+          (goto-char (cdr avoid)))
+         ((agent-shell-markdown--straddles-avoid-range-p
+           markup-start markup-end avoid-ranges)
+          (goto-char (1+ markup-start)))
+         (t
           (agent-shell-markdown--emphasize-span
            :markup-start markup-start :markup-end markup-end
            :content-start (match-beginning 1) :content-end (match-end 1)
            :face 'agent-shell-markdown-strikethrough)
-          (setq changed t))))
+          (setq changed t)))))
     changed))
 
-(cl-defun agent-shell-markdown--replace-headers (&key avoid-ranges)
+(defconst agent-shell-markdown--header-last-line-regexp
+  (rx bol (zero-or-more blank) (one-or-more "#")
+      (one-or-more blank)
+      (one-or-more (not (any "\n")))
+      eos)
+  "Regexp matching a header line anchored at the accessible buffer end.
+Like the line `agent-shell-markdown--replace-headers' matches, but
+ending at `eos' instead of a trailing `\\n'.  Used to find a header
+ending text that is complete, so no newline is coming for it.")
+
+(cl-defun agent-shell-markdown--replace-headers (&key avoid-ranges complete)
   "Replace `# X' / `## X' / ... headers with X faced as `org-level-N'.
 
 The `#' prefix and one or more separator spaces are stripped; the
@@ -787,7 +906,9 @@ Requires an explicit trailing newline — a header at end-of-buffer
 without `\\n' is treated as still streaming and left raw, so a
 chunk that lands `# He' followed later by `llo World\\n' renders
 the full `Hello World' on the second call rather than eagerly
-facing `He' and leaving `llo World' plain.
+facing `He' and leaving `llo World' plain.  Pass COMPLETE non-nil
+when no more text will be appended, so a header ending the buffer
+renders too.
 
 For example, the buffer \"## My title\\n\" becomes \"My title\\n\"
 with face `agent-shell-markdown-header-2' on \"My title\"."
@@ -796,7 +917,8 @@ with face `agent-shell-markdown-header-2' on \"My title\"."
     (while (re-search-forward
             (rx bol (zero-or-more blank) (group (one-or-more "#"))
                 (one-or-more blank)
-                (group (one-or-more (not (any "\n")))) "\n")
+                (group (one-or-more (not (any "\n"))))
+                (group (regexp (if complete (rx (or "\n" eos)) "\n"))))
             nil t)
       (let* ((markup-start (match-beginning 0))
              (markup-end (match-end 0))
@@ -813,13 +935,15 @@ with face `agent-shell-markdown-header-2' on \"My title\"."
                  ;; `text' keeps the title's own properties.  Carry the newline
                  ;; separately so its trailing-whitespace invisibility does not
                  ;; hide the title.
+                 (terminator (match-string-no-properties 3))
                  (newline-properties
-                  (agent-shell-markdown--carry-properties (1- markup-end))))
+                  (unless (string-empty-p terminator)
+                    (agent-shell-markdown--carry-properties (1- markup-end)))))
             (delete-region markup-start markup-end)
             (goto-char markup-start)
             (insert text)
             (let ((end (point)))
-              (insert "\n")
+              (insert terminator)
               (when newline-properties
                 (add-text-properties end (point) newline-properties))
               (add-face-text-property
@@ -846,38 +970,49 @@ of them but one: `agent-shell-markdown--linkify-file-references' links
 a `path:line' citation in here, adding properties without reading the
 body as markup, so what the tag is for survives.
 
+Spans may be delimited by any run of backticks, closed by a run of
+the same length, so the body can hold shorter runs: the buffer
+\"a `` `x` `` b\" faces \"`x`\".  As in CommonMark, one space is
+stripped from each side of a body that both starts and ends with a
+space (unless it is all spaces).
+
 For example, the buffer \"a `code` b\" becomes \"a code b\" with
 face `agent-shell-markdown-inline-code' on \"code\"."
   (let ((case-fold-search nil))
     (goto-char (point-min))
-    (while (re-search-forward "`\\([^`\n]+\\)`" nil t)
-      (let* ((markup-start (match-beginning 0))
-             (markup-end (match-end 0))
-             (avoid (agent-shell-markdown-in-avoid-range-p
-                     markup-start markup-end avoid-ranges)))
-        (if avoid
-            (goto-char (cdr avoid))
-          (let ((source (unless (get-text-property markup-start
-                                                   'agent-shell-markdown-source)
-                          (agent-shell-markdown-reconstruct
-                           markup-start markup-end))))
-            ;; Delete the two backticks where they stand rather than the
-            ;; span as a whole: the `:inline-code-ranges' every later pass
-            ;; avoids this body through are markers into it, and deleting
-            ;; the span collapses them onto a single point.  The body would
-            ;; then read as ordinary prose, rendering `[title](url)' inside
-            ;; backticks as a link instead of the literal text asked for.
-            (delete-region (1- markup-end) markup-end)
-            (delete-region markup-start (1+ markup-start))
-            (let ((end (- markup-end 2)))
-              (add-face-text-property markup-start end 'agent-shell-markdown-inline-code)
-              (add-text-properties markup-start end
-                                   '(agent-shell-markdown-frozen t
-                                                                 rear-nonsticky (agent-shell-markdown-frozen)))
-              (when source
-                (put-text-property markup-start end
-                                   'agent-shell-markdown-source source))
-              (goto-char end))))))))
+    (while-let ((span (agent-shell-markdown--next-code-span
+                       :avoid-ranges avoid-ranges)))
+      (when-let* ((markup-start (map-elt span :start))
+                  (markup-end (map-elt span :end)))
+        (let* ((padding (if (string-match-p
+                             "\\` .*[^ ].* \\'"
+                             (buffer-substring-no-properties
+                              (map-elt span :body-start) (map-elt span :body-end)))
+                            1
+                          0))
+               (body-start (+ (map-elt span :body-start) padding))
+               (body-end (- (map-elt span :body-end) padding))
+               (source (unless (get-text-property markup-start
+                                                  'agent-shell-markdown-source)
+                         (agent-shell-markdown-reconstruct
+                          markup-start markup-end))))
+          ;; Delete the delimiters where they stand rather than the
+          ;; span as a whole: the `:inline-code-ranges' every later pass
+          ;; avoids this body through are markers into it, and deleting
+          ;; the span collapses them onto a single point.  The body would
+          ;; then read as ordinary prose, rendering `[title](url)' inside
+          ;; backticks as a link instead of the literal text asked for.
+          (delete-region body-end markup-end)
+          (delete-region markup-start body-start)
+          (let ((end (+ markup-start (- body-end body-start))))
+            (add-face-text-property markup-start end 'agent-shell-markdown-inline-code)
+            (add-text-properties markup-start end
+                                 '(agent-shell-markdown-frozen t
+                                                               rear-nonsticky (agent-shell-markdown-frozen)))
+            (when source
+              (put-text-property markup-start end
+                                 'agent-shell-markdown-source source))
+            (goto-char end)))))))
 
 (cl-defun agent-shell-markdown--link-markup-regexp (&key as-image?)
   "Return a regexp matching link (or image, when AS-IMAGE?) markup.
@@ -930,7 +1065,7 @@ exists, and \"open in browser\" once it doesn't."
           "open file"
         "open in browser")))
 
-(cl-defun agent-shell-markdown--apply-link-properties (&key start end url verb)
+(cl-defun agent-shell-markdown--apply-link-properties (&key start end url verb tracking-file)
   "Make [START, END) a rendered link to URL.
 
 Applies what every link the renderer produces carries: face
@@ -940,16 +1075,23 @@ mouse, a hand pointer, and the target itself on
 `agent-shell-markdown-url' -- which is what
 `agent-shell-markdown-link-url-at-point' reads and what item
 navigation stops on, so a link missing it would open on RET yet stay
-invisible to both.
+invisible to both.  Web URLs also carry `browse-url-data', so
+terminal Emacs can display them as OSC 8 hyperlinks when enabled.
 
 VERB names the action in both hints (see
 `agent-shell-markdown--link-verb' for the default and when it
 resolves).
 
+TRACKING-FILE, when non-nil, records opening the link there (see
+`agent-shell-markdown--track-link-open').
+
 For example, over the `docs' of a rendered \"[docs](https://gnu.org)\",
 RET opens the URL, the echo area reads \"Press RET to open in
 browser\", and hovering shows \"Open in browser\"."
   (let* ((open-action (lambda () (interactive)
+                        (when tracking-file
+                          (agent-shell-markdown--track-link-open
+                           :url url :tracking-file tracking-file))
                         (agent-shell-markdown--open-link url)))
          (link-map (agent-shell-markdown--make-ret-binding-map open-action)))
     (agent-shell-markdown--add-link-face start end)
@@ -970,7 +1112,22 @@ browser\", and hovering shows \"Open in browser\"."
                                    (substring text 1)))))
     ;; A hand pointer when over is enough. No need for `mouse-face'.
     (put-text-property start end 'pointer 'hand)
-    (put-text-property start end 'agent-shell-markdown-url url)))
+    (put-text-property start end 'agent-shell-markdown-url url)
+    ;; `browse-url-data' is where Emacs keeps a URL on text (see
+    ;; `browse-url-button-open' and `ansi-osc-hyperlink-handler').
+    ;; Nothing here reads it, as agent-shell keymap handles RET and clicks,
+    ;; but a terminal Emacs that emits OSC 8 hyperlinks from it lets
+    ;; the terminal open web links on its own machine, which matters
+    ;; when Emacs runs remotely (for example over SSH), where
+    ;; `browse-url' would open them on the remote host.  Only web
+    ;; URLs are tagged, with a bare `www.' host given a scheme so it
+    ;; opens as such.
+    (let ((case-fold-search t))
+      (put-text-property
+       start end 'browse-url-data
+       (cond ((string-match-p "\\`https?://[^/?#[:space:]]+" url) url)
+             ((string-match-p "\\`www\\.[^/?#[:space:]]+" url)
+              (concat "https://" url)))))))
 
 (defun agent-shell-markdown--add-link-face (start end)
   "Add the link face over [START, END), skipping where it already is.
@@ -995,7 +1152,7 @@ second half gains the face."
           (add-face-text-property pos next 'agent-shell-markdown-link))
         (setq pos next)))))
 
-(cl-defun agent-shell-markdown--replace-links (&key avoid-ranges)
+(cl-defun agent-shell-markdown--replace-links (&key avoid-ranges tracking-file)
   "Replace `[title](url)' markup with title faced as link.
 
 The bracket/parenthesis markup is stripped; the title is left
@@ -1011,9 +1168,19 @@ A bare `(url)' destination and the CommonMark angle-bracketed
 `(<url>)' form are both accepted; the latter allows spaces in the
 URL (see `agent-shell-markdown--link-markup-regexp').
 
+With TRACKING-FILE, a Pandoc-style `{...}' block directly after the
+markup is consumed with it, and a `tracking-label' in it shows after
+the title until the link is recorded as opened in TRACKING-FILE.  The
+label is display-only (a `display' string on the title's last
+character), so it is never part of the buffer text.
+
 For example, the buffer \"see [docs](https://example.com)\"
 becomes \"see docs\" with face `agent-shell-markdown-link' on \"docs\"
-and a keymap that opens the URL."
+and a keymap that opens the URL.  With TRACKING-FILE,
+\"[docs](https://example.com){tracking-label=\\\"(new)\\\"}\" becomes
+\"docs (new)\" until opened, and \"docs\" afterwards."
+  (when tracking-file
+    (agent-shell-markdown--load-opened-links tracking-file))
   (let ((case-fold-search nil)
         (regexp (agent-shell-markdown--link-markup-regexp)))
     (goto-char (point-min))
@@ -1028,21 +1195,52 @@ and a keymap that opens the URL."
          (avoid (goto-char (cdr avoid)))
          (is-image nil)
          (t
-          (let ((title (buffer-substring (match-beginning 1) (match-end 1)))
-                (url (agent-shell-markdown--link-markup-url))
-                (source (unless (get-text-property markup-start
-                                                   'agent-shell-markdown-source)
-                          (agent-shell-markdown-reconstruct
-                           markup-start markup-end))))
-            (delete-region markup-start markup-end)
+          (let* ((title (buffer-substring (match-beginning 1) (match-end 1)))
+                 (url (agent-shell-markdown--link-markup-url))
+                 ;; Only callers passing TRACKING-FILE opt into `{...}'
+                 ;; attributes.  Elsewhere (e.g. streamed agent output)
+                 ;; the block stays literal text.
+                 (attribute-match (when tracking-file
+                                    (save-excursion
+                                      (goto-char markup-end)
+                                      (when (looking-at "{\\([^}\n]*\\)}")
+                                        (cons (match-string 1) (match-end 0))))))
+                 (tracking-label (when attribute-match
+                                   (map-elt (agent-shell-markdown--parse-link-attributes
+                                             (car attribute-match))
+                                            :tracking-label)))
+                 (content-end (if attribute-match (cdr attribute-match) markup-end))
+                 (source (unless (get-text-property markup-start
+                                                    'agent-shell-markdown-source)
+                           (agent-shell-markdown-reconstruct
+                            markup-start content-end))))
+            (delete-region markup-start content-end)
             (goto-char markup-start)
             (insert title)
-            (let ((end (+ markup-start (length title))))
-              (agent-shell-markdown--apply-link-properties
-               :start markup-start :end end :url url)
-              (when source
-                (put-text-property markup-start end
-                                   'agent-shell-markdown-source source))))))))))
+            (agent-shell-markdown--apply-link-properties
+             :start markup-start :end (point) :url url
+             :tracking-file (when tracking-label tracking-file))
+            (when (and tracking-label
+                       (> (point) markup-start)
+                       (not (agent-shell-markdown--link-opened-p
+                             :url url :tracking-file tracking-file)))
+              ;; Drawn in place of the title's last character rather than
+              ;; inserted, so the buffer length never changes: opening the
+              ;; link hides the label without editing text other code
+              ;; (e.g. comint markers) relies on.
+              (put-text-property
+               (1- (point)) (point) 'display
+               `(when (not (agent-shell-markdown--link-opened-p
+                            :url ,url :tracking-file ,tracking-file))
+                  . ,(concat (buffer-substring (1- (point)) (point))
+                             ;; A display string merges in the face of the text
+                             ;; it replaces, so drop the link's underline.
+                             (propertize (concat " " tracking-label)
+                                         'face '((:underline nil)
+                                                 agent-shell-markdown-inline-code))))))
+            (when source
+              (put-text-property markup-start (point)
+                                 'agent-shell-markdown-source source)))))))))
 
 (cl-defun agent-shell-markdown--linkify-urls (&key avoid-ranges)
   "Face bare URLs in prose as links, openable from the buffer.
@@ -1435,7 +1633,16 @@ property, so the source markdown round-trips through copy/save."
                  'agent-shell-markdown-frozen t
                  'rear-nonsticky '(display agent-shell-markdown-frozen))))))))
 
-(cl-defun agent-shell-markdown--style-blockquotes (&key avoid-ranges)
+(defconst agent-shell-markdown--blockquote-last-line-regexp
+  (rx bol (zero-or-more blank) ">"
+      (zero-or-more (not (any "\n")))
+      eos)
+  "Regexp matching a blockquote line anchored at the accessible buffer end.
+Like the line `agent-shell-markdown--style-blockquotes' matches, but
+ending at `eos' instead of a trailing `\\n'.  Used to find a blockquote
+line ending text that is complete, so no newline is coming for it.")
+
+(cl-defun agent-shell-markdown--style-blockquotes (&key avoid-ranges complete)
   "Render `>'-prefixed lines as blockquotes with vertical bars.
 
 Each leading `>' character on the line is shown as `▌' via a
@@ -1452,7 +1659,9 @@ Whitespace between `>'s is preserved literally.
 
 Requires an explicit trailing newline — a blockquote line at
 end-of-buffer without `\\n' is treated as still streaming and
-left raw, matching the header behaviour.
+left raw, matching the header behaviour.  Pass COMPLETE non-nil
+when no more text will be appended, so that last line renders too
+\(e.g. a response ending on a quoted line).
 
 Lines inside any of AVOID-RANGES (e.g. fenced code blocks) are
 left untouched."
@@ -1462,7 +1671,8 @@ left untouched."
     (while (re-search-forward
             (rx bol (zero-or-more blank)
                 ">" (zero-or-more (any " \t>"))
-                (zero-or-more (not (any "\n"))) "\n")
+                (zero-or-more (not (any "\n")))
+                (regexp (if complete (rx (or "\n" eos)) "\n")))
             nil t)
       (let* ((line-start (match-beginning 0))
              (line-end (match-end 0))
@@ -1477,7 +1687,10 @@ left untouched."
               (put-text-property (point) (1+ (point)) 'display bar)
               (forward-char 1)
               (skip-chars-forward " \t" line-end)))
-          (add-face-text-property line-start (1- line-end)
+          (add-face-text-property line-start
+                                  (if (eq (char-before line-end) ?\n)
+                                      (1- line-end)
+                                    line-end)
                                   'agent-shell-markdown-blockquote)
           (add-text-properties line-start line-end
                                '(agent-shell-markdown-frozen t
@@ -1782,8 +1995,7 @@ matching.")
   "Regexp matching a list-item line anchored at the accessible buffer end.
 Like `agent-shell-markdown--list-item-line-regexp' but ending at `eos'
 instead of a trailing `\\n', with the same groups.  Used for a list item
-on the last line of a narrowed body, whose terminating newline sits just
-outside the narrow.")
+ending text that is complete, so no newline is coming for it.")
 
 (defconst agent-shell-markdown--list-item-pending-regexp
   (rx bol (zero-or-more (any " \t"))
@@ -1909,7 +2121,7 @@ reconstructing to `- [x] Done'."
     (set-marker end nil)
     (set-marker content-end nil)))
 
-(cl-defun agent-shell-markdown--style-lists (&key avoid-ranges)
+(cl-defun agent-shell-markdown--style-lists (&key avoid-ranges complete)
   "Render markdown list lines: bullets, task checkboxes, ordered numbers.
 
 Each `-'/`*'/`+' or `N.' item line (with an explicit trailing
@@ -1919,7 +2131,8 @@ marker replaced by a glyph and gets a base indent, via
 stashed on `agent-shell-markdown-source' so
 `agent-shell-copy-as-markdown' round-trips it; a plain copy yields
 the rendered glyphs.  Lines inside AVOID-RANGES (e.g. fenced code
-blocks) are left untouched.
+blocks) are left untouched.  A list item on the last line, with no
+newline yet, renders only when COMPLETE says no more text is coming.
 
 For example, the buffer:
 
@@ -1945,16 +2158,13 @@ a two-column base indent."
            :marker-start (match-beginning 2)
            :marker-end (match-end 2)
            :content-start (match-end 3)))))
-    ;; A fragment body is rendered under a narrow to its content, so a
-    ;; list item on the last line has its terminating newline just past
-    ;; the narrow (or none yet).  The loop above is newline-anchored, so
-    ;; that last item is never rendered.  Handle it here, but only when a
-    ;; newline actually exists immediately past the narrow: that proves
-    ;; the line is complete rather than a still-streaming frontier (whose
-    ;; marker must stay raw until it is known to be a list item).
-    (when-let* ((narrow-end (point-max))
-                ((save-restriction (widen) (eq (char-after narrow-end) ?\n))))
-      (goto-char narrow-end)
+    ;; The loop above is newline-anchored, so a list item on the last
+    ;; line is left raw: more of it may still stream in.  Render it once
+    ;; COMPLETE says nothing will.  A newline just past a narrowed
+    ;; fragment body is the fragment's padding, not the item's own, so
+    ;; it says nothing about the line being done (issue #867).
+    (when complete
+      (goto-char (point-max))
       (beginning-of-line)
       (when (and (not (get-text-property (point)
                                          'agent-shell-markdown-list-rendered))
@@ -2299,7 +2509,7 @@ gains a blank line above and below it:
            (looking-at-p agent-shell-markdown--list-item-frontier-regexp)))
      start)))
 
-(cl-defun agent-shell-markdown--find-tables (&key avoid-ranges)
+(cl-defun agent-shell-markdown--find-tables (&key avoid-ranges complete)
   "Return tables to (re-)render in current buffer.
 
 Each element is an alist with keys :start, :end (the region to
@@ -2325,14 +2535,22 @@ Two flavours of region are collected:
 
 A rendered table with no extension is skipped, since re-rendering
 unchanged source is a no-op.  Tables inside any of AVOID-RANGES are
-left untouched."
+left untouched.
+
+A row on the last line, with no newline yet, is left raw unless
+COMPLETE says no more text is coming.  A chunk ending at a cell's
+`|' looks like a whole row, so rendering it would commit the rest of
+the row as raw continuation chunks, and markup split across two of
+them (e.g. `[a' then `](b)') would never be styled."
   ;; agent-shell tags its body chars with `field output' while the
   ;; `\\n's between rows may not carry the same field value; without
   ;; this binding, `forward-line' / `line-end-position' would stop at
   ;; those field boundaries and silently truncate table rows.
   (let ((inhibit-field-text-motion t)
         (tables '())
-        (pos (point-min)))
+        (pos (point-min))
+        (settled-p (lambda ()
+                     (or complete (< (line-end-position) (point-max))))))
     (save-excursion
       (while (< pos (point-max))
         (goto-char pos)
@@ -2364,7 +2582,8 @@ left untouched."
             (save-excursion
               (goto-char rendered-end)
               (when (and (< (point) (point-max))
-                         (not (eq (char-after) ?\n)))
+                         (not (eq (char-after) ?\n))
+                         (funcall settled-p))
                 (end-of-line)
                 (setq trailing-end (point)))
               (when (and (< (point) (point-max))
@@ -2372,6 +2591,7 @@ left untouched."
                 (forward-char 1)
                 (while (and (not (eobp))
                             (looking-at agent-shell-markdown--table-line-regexp)
+                            (funcall settled-p)
                             (not (get-text-property (point)
                                                     'agent-shell-markdown-frozen))
                             (not (agent-shell-markdown-in-avoid-range-p
@@ -2404,6 +2624,7 @@ left untouched."
             ;; yet) keeps the contained rows raw.
             (while (and (not (eobp))
                         (looking-at agent-shell-markdown--table-line-regexp)
+                        (funcall settled-p)
                         (not (get-text-property (point)
                                                 'agent-shell-markdown-frozen))
                         (not (agent-shell-markdown-in-avoid-range-p
@@ -2476,9 +2697,10 @@ are still parsed as cell separators."
     (nreverse cells)))
 
 (defvar-local agent-shell-markdown--table-char-pixel-cache nil
-  "Cons cell (FONT-WIDTH . SPACE-PIXELS).
+  "Cons cell ((FONT-WIDTH . REMAPPING) . SPACE-PIXELS).
 Caches the rendered pixel width of a single space in the buffer;
-invalidated when the font width changes (e.g. text scaling).
+invalidated when the font width changes (e.g. text scaling) or
+`face-remapping-alist' does (e.g. toggling `mixed-pitch-mode').
 Stored in the destination buffer (the one displayed in the
 window passed to the measurement helpers), so cache lookups are
 per-destination.")
@@ -2500,7 +2722,8 @@ it a text-scaled buffer measures at its unscaled width and every table
 in it misaligns.  `display-line-numbers' and the two prefixes are
 neutralized for the reason `string-pixel-width' neutralizes them: a
 globally enabled line-number gutter would otherwise be counted into
-the width (bug#59311).
+the width (bug#59311).  STR is measured under the
+`agent-shell-markdown-table' face it is displayed with.
 
 For example, in a buffer whose font is 10 pixels wide,
 \"MMMMMMMMMM\" measures 100, and 170 under `text-scale-mode' +3."
@@ -2515,19 +2738,25 @@ For example, in a buffer whose font is 10 pixels wide,
       ;; STR carries the cell's own properties, prefixes included.
       (remove-text-properties (point-min) (point-max)
                               '(line-prefix nil wrap-prefix nil))
+      ;; Rendered cells carry `agent-shell-markdown-table' underneath their
+      ;; own faces, so measure under it too.  Otherwise a remapping of it
+      ;; (e.g. `mixed-pitch-mode' pinning it to `fixed-pitch') is ignored
+      ;; and cells are measured in a font they are not displayed in.
+      (add-face-text-property (point-min) (point-max)
+                              'agent-shell-markdown-table t)
       (car (buffer-text-pixel-size nil window t)))))
 
 (defun agent-shell-markdown--table-char-pixel-width (window)
   "Return real pixel width of a single space in WINDOW, cached.
 Cache lives in the destination buffer and is invalidated when
-its font width changes."
+its font width or face remapping changes."
   (with-current-buffer (window-buffer window)
-    (let ((fw (window-font-width window)))
+    (let ((key (cons (window-font-width window) face-remapping-alist)))
       (if (and agent-shell-markdown--table-char-pixel-cache
-               (= fw (car agent-shell-markdown--table-char-pixel-cache)))
+               (equal key (car agent-shell-markdown--table-char-pixel-cache)))
           (cdr agent-shell-markdown--table-char-pixel-cache)
         (let ((sw (agent-shell-markdown--table-measure-string " " window)))
-          (setq agent-shell-markdown--table-char-pixel-cache (cons fw sw))
+          (setq agent-shell-markdown--table-char-pixel-cache (cons key sw))
           sw)))))
 
 (defvar agent-shell-markdown--table-default-line-height nil
@@ -2547,9 +2776,8 @@ scripts with tall ascenders/descenders like Arabic (~0.63).")
 (defun agent-shell-markdown--table-measure-line-height (win str)
   "Return the rendered pixel height of STR as a single line in WIN."
   (with-temp-buffer
-    (set-window-buffer win (current-buffer))
     (insert str "\n")
-    (cdr (window-text-pixel-size win 1 3))))
+    (cdr (buffer-text-pixel-size nil win))))
 
 (defun agent-shell-markdown--table-char-height-scale (char)
   "Return the display height scale needed for CHAR, or nil if none.
@@ -2568,22 +2796,19 @@ brings the glyph back to the default height.  Results are cached."
                          'miss)))
     (if (eq cached 'miss)
         (let ((scale
-               (let ((win (selected-window))
-                     (orig-buf (window-buffer)))
-                 (unwind-protect
-                     (let* ((default-h
-                             (or agent-shell-markdown--table-default-line-height
-                                 (setq agent-shell-markdown--table-default-line-height
-                                       (agent-shell-markdown--table-measure-line-height
-                                        win "A"))))
-                            (char-h (agent-shell-markdown--table-measure-line-height
-                                     win (string char))))
-                       (when (> char-h default-h)
-                         (let ((ratio (/ (float default-h) char-h)))
-                           (and (>= ratio
-                                    agent-shell-markdown--table-min-height-scale)
-                                ratio))))
-                   (set-window-buffer win orig-buf)))))
+               (let* ((win (selected-window))
+                      (default-h
+                       (or agent-shell-markdown--table-default-line-height
+                           (setq agent-shell-markdown--table-default-line-height
+                                 (agent-shell-markdown--table-measure-line-height
+                                  win "A"))))
+                      (char-h (agent-shell-markdown--table-measure-line-height
+                               win (string char))))
+                 (when (> char-h default-h)
+                   (let ((ratio (/ (float default-h) char-h)))
+                     (and (>= ratio
+                              agent-shell-markdown--table-min-height-scale)
+                          ratio))))))
           (puthash char scale agent-shell-markdown--table-height-scale-cache)
           scale)
       cached)))
@@ -2723,7 +2948,7 @@ different pixel width than `string-width' reports."
       (next-single-property-change 0 'face text)))
 
 (defvar-local agent-shell-markdown--table-face-width-cache nil
-  "Hash table mapping face value → pixel-width ratio vs unfaced text.
+  "Hash table mapping (FACE . REMAPPING) → pixel-width ratio vs unfaced text.
 Cache lives in the destination buffer so per-buffer font settings
 \(text scaling, face remapping) get their own ratios.  Lazily
 initialized.")
@@ -2731,7 +2956,7 @@ initialized.")
 (defun agent-shell-markdown--table-face-width-ratio (face window)
   "Return pixel-width ratio of FACE-styled text vs unfaced text in WINDOW.
 A ratio of 1.0 means FACE doesn't affect rendered char width.
-Cached per face in the destination buffer.
+Cached per face and `face-remapping-alist' in the destination buffer.
 
 Ratios are always positive floats, so nil from `gethash' reliably
 means \"not cached yet\", no sentinel needed."
@@ -2739,11 +2964,12 @@ means \"not cached yet\", no sentinel needed."
     (unless agent-shell-markdown--table-face-width-cache
       (setq agent-shell-markdown--table-face-width-cache
             (make-hash-table :test 'equal)))
-    (or (gethash face agent-shell-markdown--table-face-width-cache)
+    (or (gethash (cons face face-remapping-alist)
+                 agent-shell-markdown--table-face-width-cache)
         (let* ((sample "MMMMMMMMMM")
                (plain-px (agent-shell-markdown--table-measure-string
                           sample window)))
-          (puthash face
+          (puthash (cons face face-remapping-alist)
                    (if (zerop plain-px) 1.0
                      (/ (float (agent-shell-markdown--table-measure-string
                                 (propertize sample 'face face) window))
@@ -3895,6 +4121,8 @@ measurement falls back to `string-width' — fine for ASCII but
 prone to a few-pixel drift on emoji-heavy tables."
   (agent-shell-with-work-buffer
     (insert source)
+    (agent-shell-markdown--restore-face-from-font-lock-face
+     (point-min) (point-max))
     ;; SOURCE inherits `field' text properties from the calling buffer
     ;; (e.g. agent-shell tags chars with `field output'); inter-row
     ;; `\\n's may carry different field values, which would otherwise
@@ -3940,7 +4168,8 @@ prone to a few-pixel drift on emoji-heavy tables."
                               (= (mod data-row-num 2) 1)))
                (row-face (cond
                           (is-header 'agent-shell-markdown-table-header)
-                          (is-zebra 'agent-shell-markdown-table-zebra))))
+                          (is-zebra 'agent-shell-markdown-table-zebra)
+                          ((not is-separator) 'agent-shell-markdown-table))))
           (unless (or is-header is-separator)
             (setq data-row-num (1+ data-row-num)))
           (push (if is-separator
@@ -3981,7 +4210,7 @@ Each row is an alist with :start, :end, :num, :separator."
       (setq idx (1+ idx)))
     result))
 
-(cl-defun agent-shell-markdown--style-tables (&key avoid-ranges)
+(cl-defun agent-shell-markdown--style-tables (&key avoid-ranges complete)
   "Render markdown tables found in current buffer.
 
 Each detected table has its source rows deleted from the buffer
@@ -3993,7 +4222,9 @@ previously-rendered table — are left alone.
 
 AVOID-RANGES is a list of (START . END) cons cells covering
 regions the renderer must not touch (e.g. still-open fenced code
-blocks whose closing fence hasn't streamed in yet).
+blocks whose closing fence hasn't streamed in yet).  A row on the
+last line, with no newline yet, renders only when COMPLETE says no
+more text is coming.
 
 Honours `agent-shell-markdown-prettify-tables'.  Cell content is taken
 directly from the buffer (with text properties preserved from
@@ -4003,7 +4234,8 @@ rendering inside cells is provided for free."
     ;; Process tables in reverse so earlier positions stay valid as
     ;; each replacement shifts everything after it.
     (dolist (table (nreverse (agent-shell-markdown--find-tables
-                              :avoid-ranges avoid-ranges)))
+                              :avoid-ranges avoid-ranges
+                              :complete complete)))
       (agent-shell-markdown--render-table table))))
 
 (defun agent-shell-markdown-table-next-cell ()
@@ -4154,6 +4386,28 @@ produced."
             (next (or (next-single-property-change pos 'face nil end) end)))
         (when face
           (put-text-property pos next 'font-lock-face face))
+        (setq pos next)))))
+
+(defun agent-shell-markdown--restore-face-from-font-lock-face (start end)
+  "Copy `font-lock-face' back onto `face' across [START, END).
+
+The inverse of `agent-shell-markdown--mirror-face-to-font-lock-face',
+for text styled by one render and re-read by a later one.
+Re-fontification in between clears `face' but leaves the mirrored
+`font-lock-face', so a pass that rebuilds text from its faces (e.g. a
+table folding in a row styled while it waited for its newline) would
+otherwise drop the styling.  Positions that still carry a `face' are
+left alone.
+
+For example, \"old value\" carrying only `font-lock-face'
+`agent-shell-markdown-strikethrough' gets `face'
+`agent-shell-markdown-strikethrough' too."
+  (let ((pos start))
+    (while (< pos end)
+      (let ((next (next-property-change pos nil end)))
+        (when-let* ((face (get-text-property pos 'font-lock-face))
+                    ((not (get-text-property pos 'face))))
+          (put-text-property pos next 'face face))
         (setq pos next)))))
 
 (defun agent-shell-markdown--highlight-code (code lang)
@@ -4318,6 +4572,91 @@ resizing isn't bound."
   (unless (agent-shell-markdown--open-local-link url)
     (browse-url url)))
 
+(defun agent-shell-markdown--parse-link-attributes (string)
+  "Parse Pandoc-style link attributes from STRING (a `{...}' body).
+Returns an alist holding `:tracking-label' for a `tracking-label='
+entry, whose value may be double-quoted to hold spaces.  Other
+attributes are ignored.
+
+For example, (agent-shell-markdown--parse-link-attributes
+\"tracking-label=\\\"(new)\\\"\") returns \\='((:tracking-label . \"(new)\"))."
+  (when (string-match "\\_<tracking-label[ \t]*=[ \t]*\\(?:\"\\([^\"]*\\)\"\\|\\([^ \t\"]+\\)\\)"
+                      string)
+    (list (cons :tracking-label (or (match-string 1 string)
+                                    (match-string 2 string))))))
+
+(defvar agent-shell-markdown--opened-links nil
+  "Links known to be opened, each a (TRACKING-FILE . URL) cons.
+
+Mirrors the tracking files in memory, as tracking labels check it on
+every redisplay (see `agent-shell-markdown--link-opened-p').")
+
+(defun agent-shell-markdown--read-tracked-links (tracking-file)
+  "Return the opened links recorded in TRACKING-FILE.
+
+Each is an alist holding the link's `:url' and when it was first
+`:opened', as written by `agent-shell-markdown--track-link-open'.  A
+missing or unreadable file holds none.
+
+For example, once https://example.com/post has been opened, returns
+\\='(((:url . \"https://example.com/post\")
+    (:opened . \"2026-10-12T14:54:03+0100\")))"
+  (when (file-readable-p tracking-file)
+    (with-temp-buffer
+      (insert-file-contents tracking-file)
+      (when-let* ((links (ignore-errors (read (current-buffer))))
+                  ((proper-list-p links)))
+        links))))
+
+(defun agent-shell-markdown--load-opened-links (tracking-file)
+  "Add the links TRACKING-FILE records as opened to the in-memory set.
+
+That set is `agent-shell-markdown--opened-links', which
+`agent-shell-markdown--link-opened-p' consults.
+
+For example, with TRACKING-FILE recording https://example.com/post,
+adds (TRACKING-FILE . \"https://example.com/post\")."
+  (seq-doseq (link (agent-shell-markdown--read-tracked-links tracking-file))
+    (add-to-list 'agent-shell-markdown--opened-links
+                 (cons tracking-file (map-elt link :url)))))
+
+(cl-defun agent-shell-markdown--link-opened-p (&key url tracking-file)
+  "Return non-nil when URL is known to be opened in TRACKING-FILE.
+
+Only checks `agent-shell-markdown--opened-links', so it is cheap enough
+for the redisplay-time condition hiding a tracking label.
+
+For example, returns nil for https://example.com/post until a link to
+it carrying a `tracking-label' is opened."
+  (seq-contains-p agent-shell-markdown--opened-links (cons tracking-file url)))
+
+(cl-defun agent-shell-markdown--track-link-open (&key url tracking-file)
+  "Record URL as opened in TRACKING-FILE, hiding its tracking labels.
+
+The buffer is left untouched: labels are `display' strings whose
+condition consults `agent-shell-markdown--opened-links', so marking
+URL there hides them in every buffer on the next redisplay.  URL is
+added to TRACKING-FILE once, so its `:opened' time is when it was
+first opened.
+
+For example, opening \"docs (new)\" leaves \"docs\" showing, and
+TRACKING-FILE gains ((:url . URL) (:opened . \"2026-10-12T14:54:03+0100\"))."
+  ;; Another Emacs may have recorded URL since this one last read the file.
+  (agent-shell-markdown--load-opened-links tracking-file)
+  (unless (agent-shell-markdown--link-opened-p :url url :tracking-file tracking-file)
+    (make-directory (file-name-directory tracking-file) t)
+    (with-temp-file tracking-file
+      (let ((print-length nil)
+            (print-level nil))
+        (prin1 (append (agent-shell-markdown--read-tracked-links tracking-file)
+                       (list (list (cons :url url)
+                                   (cons :opened (format-time-string "%FT%T%z")))))
+               (current-buffer))))
+    (add-to-list 'agent-shell-markdown--opened-links (cons tracking-file url)))
+  ;; Redisplay skips windows whose text did not change, so ask for all
+  ;; of them to re-evaluate the label conditions.
+  (force-window-update))
+
 (defun agent-shell-markdown--open-externally (file)
   "Prompt to open FILE with the operating system's default external program.
 Opens FILE only if the user confirms.  Uses `shell-command-do-open' on
@@ -4462,21 +4801,67 @@ meaningless for binary)."
 Matches a line (\"10\"), a range (\"10-24\", GitHub's \"10-L24\") and a
 line with a column (\"10:5\").")
 
-(defconst agent-shell-markdown--file-reference-regexp
-  (rx (any alnum "._~/@_")
-      (zero-or-more (any alnum "._~/@+_-"))
-      (or "#L" ":")
+(defconst agent-shell-markdown--file-reference-location-regexp
+  (rx (or "#L" ":")
       (regexp agent-shell-markdown--location-regexp))
-  "Regexp matching a bare `path:line' reference as agents cite sources.
+  "Regexp matching the location of a bare `path:line' reference.
+That is the separator and what follows it: `:500', `:120-140', `:12:5'
+and `#L12'.  The path before it is read by
+`agent-shell-markdown--search-file-reference'.")
 
-Matches the whole reference, path included, in the forms
+(defconst agent-shell-markdown--file-reference-path-chars "[:alnum:]._~/@+_-"
+  "Chars a bare `path:line' reference's path is made of.
+In `skip-chars-backward' form.  A path does not start with `+' or `-'
+though; see `agent-shell-markdown--search-file-reference'.")
+
+(defun agent-shell-markdown--search-file-reference ()
+  "Search forward from point for a bare `path:line' reference.
+
+Return (START . END) of the reference, leaving point at END, or nil
+when there is none, leaving point where it started, as
+`re-search-forward' with NOERROR t does.  Run this with
+`case-fold-search' nil, as
+`agent-shell-markdown--linkify-file-references' does, so that `#L'
+does not also match `#l'.  A reference is how agents cite sources,
+in the forms
 `agent-shell-markdown--parse-local-link' reads: `docs/audit.md:500',
 `src/main.rs:120-140', `foo.el:12:5' and `foo.el#L12'.  A line is
 required, so a bare path in prose is not a reference.
 
+This is a `re-search-forward' in two steps: the location
+\(`agent-shell-markdown--file-reference-location-regexp') is found
+first, then the path is read back off the chars before it.  A single
+regexp for the whole reference would restart its greedy path match at
+every char of a long unbroken run of path chars (an opaque token in a
+message, say), which is quadratic in the run's length: minutes of
+frozen Emacs on a 100 KB one.  This way each char is visited a bounded
+number of times.  The path is never read back past where the search
+started, as a regexp match could not begin before it either.
+
 Whether the path names an existing file is not asked here -- see
 `agent-shell-markdown--linkify-file-references', which is what filters
-the candidates this finds.")
+the candidates this finds."
+  (let ((origin (point))
+        found)
+    (while (and (not found)
+                (re-search-forward
+                 agent-shell-markdown--file-reference-location-regexp nil t))
+      (let ((location (match-beginning 0))
+            (end (match-end 0)))
+        (goto-char location)
+        (skip-chars-backward
+         agent-shell-markdown--file-reference-path-chars origin)
+        (skip-chars-forward "+-" location)
+        (if (>= (point) location)
+            ;; No path before this separator, so it is not a reference, but
+            ;; what looked like its location may hold one: `:1:1' has `1:1'
+            ;; in it, the same as a regexp match starting at the `1' would.
+            (goto-char (1+ location))
+          (setq found (cons (point) end))
+          (goto-char end))))
+    (unless found
+      (goto-char origin))
+    found))
 
 (defun agent-shell-markdown--parse-location (location)
   "Parse LOCATION, the location part of a local link, into an alist.
@@ -4577,10 +4962,10 @@ any rendered link carries (see
 `agent-shell-markdown--apply-link-properties'), so RET opens the file
 at the cited line and item navigation stops there.
 
-What counts as a reference is `agent-shell-markdown--file-reference-regexp',
-read through `agent-shell-markdown--parse-local-link' as any other
-local link is.  There is no markup to strip, so the reference text
-stays as it stands.
+What counts as a reference is what
+`agent-shell-markdown--search-file-reference' finds, read through
+`agent-shell-markdown--parse-local-link' as any other local link is.
+There is no markup to strip, so the reference text stays as it stands.
 
 Two things keep prose from turning into links: a reference has to name
 a line, so a bare path is left alone, and its path -- resolved against
@@ -4609,26 +4994,24 @@ For example, the buffer \"see docs/audit.md:500 now\" keeps its text,
 with \"docs/audit.md:500\" faced and opening that file at line 500."
   (let ((case-fold-search nil))
     (goto-char (point-min))
-    (while (re-search-forward agent-shell-markdown--file-reference-regexp nil t)
-      ;; Read before parsing below, which runs a `string-match' of its own
-      ;; and leaves no match data of this one behind to take positions from.
-      (let ((start (match-beginning 0))
-            (end (match-end 0)))
-        (if-let* ((avoid (agent-shell-markdown-in-avoid-range-p
-                          start end avoid-ranges)))
-            (goto-char (cdr avoid))
-          ;; Point sits right after the match, so this reads the char the
-          ;; number runs into: `foo.el#L2xy' is a word, not a reference.
-          (when (and (not (looking-at-p (rx (any alnum "_"))))
-                     (agent-shell-markdown--parse-local-link
-                      (buffer-substring-no-properties start end)))
-            ;; Inline code is the one place a frozen tag is expected here,
-            ;; and it is read off the ranges rather than the tag, so no
-            ;; other frozen text can slip through as code.
-            (agent-shell-markdown--linkify-url
-             start end
-             :in-code (agent-shell-markdown-in-avoid-range-p
-                       start end inline-ranges))))))))
+    (while-let ((reference (agent-shell-markdown--search-file-reference))
+                (start (car reference))
+                (end (cdr reference)))
+      (if-let* ((avoid (agent-shell-markdown-in-avoid-range-p
+                        start end avoid-ranges)))
+          (goto-char (cdr avoid))
+        ;; Point sits right after the match, so this reads the char the
+        ;; number runs into: `foo.el#L2xy' is a word, not a reference.
+        (when (and (not (looking-at-p (rx (any alnum "_"))))
+                   (agent-shell-markdown--parse-local-link
+                    (buffer-substring-no-properties start end)))
+          ;; Inline code is the one place a frozen tag is expected here,
+          ;; and it is read off the ranges rather than the tag, so no
+          ;; other frozen text can slip through as code.
+          (agent-shell-markdown--linkify-url
+           start end
+           :in-code (agent-shell-markdown-in-avoid-range-p
+                     start end inline-ranges)))))))
 
 (cl-defun agent-shell-markdown--url-copy-file (&key url file (timeout 5.0) content-type-prefix)
   "Download URL to FILE, returning FILE on success or nil on failure.
@@ -4982,6 +5365,52 @@ to avoid re-checking the same range on every match inside it."
       (when (and candidate (<= end (cdr candidate)))
         candidate))))
 
+(defun agent-shell-markdown--straddles-avoid-range-p (start end avoid-ranges)
+  "Return the range in AVOID-RANGES crossing START or END, or nil.
+
+A range lying wholly inside START..END doesn't count, nor does one
+wholly containing it (see `agent-shell-markdown-in-avoid-range-p').
+AVOID-RANGES is sorted and non-overlapping, as produced by
+`agent-shell-markdown-sort-ranges'.  Emphasis passes use this to
+reject a span that reaches into inline code, such as the `*' pair
+in \"* and `*`\", while still emphasizing one wrapping it whole,
+such as \"**`foo.el:12`:**\".
+
+A range ending right at END straddles too: inline code ranges
+exclude their backticks, so in \"*b `c*`\" the span ends where the
+code's content does.
+
+For example, with AVOID-RANGES [(5 . 8)], START..END 2..6 and 2..8
+return (5 . 8), while 2..5 and 2..9 return nil."
+  (or (when-let* ((range (agent-shell-markdown--last-range-before
+                          (1+ start) avoid-ranges))
+                  ((< start (cdr range))))
+        range)
+      (when-let* ((range (agent-shell-markdown--last-range-before
+                          end avoid-ranges))
+                  ((<= end (cdr range))))
+        range)))
+
+(defun agent-shell-markdown--last-range-before (pos ranges)
+  "Return the last range in RANGES starting before POS, or nil.
+
+RANGES is a vector of (BEG . END) cons cells sorted ascending by
+BEG, as produced by `agent-shell-markdown-sort-ranges'.
+
+For example, with RANGES [(1 . 3) (5 . 8)], POS 6 returns (5 . 8)
+and POS 5 returns (1 . 3)."
+  (let ((lo 0)
+        (hi (length ranges))
+        (candidate nil))
+    (while (< lo hi)
+      (let* ((mid (/ (+ lo hi) 2))
+             (range (seq-elt ranges mid)))
+        (if (< (car range) pos)
+            (setq candidate range
+                  lo (1+ mid))
+          (setq hi mid))))
+    candidate))
+
 (defun agent-shell-markdown--source-blocks ()
   "Return descriptors for the fenced code blocks in the current buffer.
 
@@ -5096,14 +5525,67 @@ range is still left alone (see `agent-shell-markdown--linkify-url')."
                       limit))))
     (nreverse ranges)))
 
+(cl-defun agent-shell-markdown--next-backtick-run (&key bound avoid-ranges)
+  "Return the next backtick run after point as (START . END), or nil.
+
+Searches up to BOUND (default `point-max'), skipping runs inside
+AVOID-RANGES, and leaves point after the run returned.
+
+For example, in the buffer \"a ``b\" from `point-min' this returns
+the range covering \"``\"."
+  (let ((run nil))
+    (while (and (not run)
+                (re-search-forward "`+" bound t))
+      (if-let* ((avoid (agent-shell-markdown-in-avoid-range-p
+                        (match-beginning 0) (match-beginning 0) avoid-ranges)))
+          (goto-char (max (point) (min (cdr avoid) (or bound (point-max)))))
+        (setq run (cons (match-beginning 0) (match-end 0)))))
+    run))
+
+(cl-defun agent-shell-markdown--next-code-span (&key bound avoid-ranges)
+  "Return the next inline code span after point as an alist, or nil.
+
+The opening backtick run is searched for up to BOUND (default
+`point-max'), skipping runs inside AVOID-RANGES.  As in CommonMark, it
+is closed by the next run of the same length on its line; runs of
+other lengths are part of the body, so `` `x` `` holds \"`x`\" (the
+padding spaces included).  The result is
+
+  ((:start . START) (:body-start . BODY-START)
+   (:body-end . BODY-END) (:end . END))
+
+where START..END spans the whole construct and BODY-START..BODY-END
+the text between the runs.  An opening run with no closer has
+`:body-end' and `:end' nil.  Point is left after the closing run, or
+after the opening run when unclosed.
+
+For example, in the buffer \"a `b` c\" from `point-min' this returns
+START 3, BODY-START 4, BODY-END 5 and END 6."
+  (when-let* ((opener (agent-shell-markdown--next-backtick-run
+                       :bound bound :avoid-ranges avoid-ranges)))
+    (let ((width (- (cdr opener) (car opener)))
+          (closer nil))
+      (while-let (((not closer))
+                  (run (agent-shell-markdown--next-backtick-run
+                        :bound (line-end-position) :avoid-ranges avoid-ranges)))
+        (when (= (- (cdr run) (car run)) width)
+          (setq closer run)))
+      (unless closer
+        (goto-char (cdr opener)))
+      (list (cons :start (car opener))
+            (cons :body-start (cdr opener))
+            (cons :body-end (car closer))
+            (cons :end (cdr closer))))))
+
 (cl-defun agent-shell-markdown--inline-code-ranges (&key avoid-ranges)
   "Return list of (start . end) ranges covering inline `X` bodies.
 
-Each range covers the text between backticks (the backticks
-themselves are not included).  Backticks inside any of
-AVOID-RANGES are ignored.  A line with an odd number of backticks
-has its trailing unmatched backtick treated as still-streaming:
-the range extends from that backtick to end-of-line.
+Each range covers the text between the delimiting backtick runs (the
+backticks themselves are not included); see
+`agent-shell-markdown--next-code-span' for how runs pair up.
+Backticks inside any of AVOID-RANGES are ignored.  A backtick run
+with no closing run on its line is treated as still-streaming: the
+range extends from that run to end-of-line.
 
 Exception: on a table row (a line beginning with `|') an unmatched
 backtick only extends to the next `|', since a code span cannot
@@ -5120,22 +5602,21 @@ one range covering the body \"code\"."
         (let ((line-beg (line-beginning-position))
               (line-end (line-end-position))
               (open nil))
-          (while (re-search-forward "`" line-end t)
-            (let ((pos (match-beginning 0)))
-              (unless (agent-shell-markdown-in-avoid-range-p pos pos avoid-ranges)
-                (if open
-                    (progn
-                      (push (cons (1+ open) pos) ranges)
-                      (setq open nil))
-                  (setq open pos)))))
+          (while-let (((not open))
+                      (span (agent-shell-markdown--next-code-span
+                             :bound line-end :avoid-ranges avoid-ranges)))
+            (if (map-elt span :end)
+                (push (cons (map-elt span :body-start) (map-elt span :body-end))
+                      ranges)
+              (setq open (map-elt span :body-start))))
           (when open
-            (push (cons (1+ open)
+            (push (cons open
                         (if (save-excursion
                               (goto-char line-beg)
                               (looking-at-p
                                agent-shell-markdown--table-pending-line-regexp))
                             (save-excursion
-                              (goto-char (1+ open))
+                              (goto-char open)
                               (if (search-forward "|" line-end t)
                                   (1- (point))
                                 line-end))

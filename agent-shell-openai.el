@@ -31,6 +31,7 @@
 (require 'acp)
 
 (declare-function agent-shell--indent-string "agent-shell")
+(declare-function agent-shell-welcome-message "agent-shell")
 (declare-function agent-shell--make-acp-client "agent-shell")
 (declare-function agent-shell-make-agent-config "agent-shell")
 (autoload 'agent-shell-make-agent-config "agent-shell")
@@ -116,6 +117,22 @@ Can be set to either a string or a function that returns a string."
   :type '(choice (const nil) string function)
   :group 'agent-shell)
 
+(defcustom agent-shell-openai-default-config-options
+  nil
+  "Default Codex config options, applied at session start.
+
+An alist of (OPTION . VALUE), using the option IDs and values
+advertised by Codex.  This can be used for reasoning effort, for
+example:
+
+  (setq agent-shell-openai-default-config-options
+        \\='((\"reasoning_effort\" . \"high\")))
+
+Available values may depend on the selected model.
+Options are applied in the order listed."
+  :type '(alist :key-type string :value-type string)
+  :group 'agent-shell)
+
 (defcustom agent-shell-openai-default-session-mode-id
   nil
   "Default Codex session mode ID.
@@ -169,6 +186,7 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
                                     (funcall agent-shell-openai-default-model-id)
                                   agent-shell-openai-default-model-id))
    :default-session-mode-id (lambda () agent-shell-openai-default-session-mode-id)
+   :default-config-options (lambda () agent-shell-openai-default-config-options)
    :client-maker (lambda (buffer)
                    (agent-shell-openai-make-codex-client :buffer buffer))
    :install-instructions "See https://github.com/agentclientprotocol/codex-acp for installation."))
@@ -224,7 +242,7 @@ Uses `agent-shell-openai-authentication' for authentication configuration."
 (defun agent-shell-openai--codex-welcome-message (config)
   "Return Codex welcome message using `shell-maker' CONFIG."
   (let ((art (agent-shell--indent-string 4 (agent-shell-openai--codex-ascii-art)))
-        (message (string-trim-left (shell-maker-welcome-message config) "\n")))
+        (message (agent-shell-welcome-message config)))
     (concat "\n\n"
             art
             "\n\n"

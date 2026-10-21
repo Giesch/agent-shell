@@ -20,6 +20,21 @@
     (let ((agent-shell-openai-default-model-id (lambda () "gpt-5.4/low")))
       (should (string= (funcall default-model-id-fn) "gpt-5.4/low")))))
 
+(ert-deftest agent-shell-openai-default-config-options-test ()
+  "Test that Codex config exposes default config options."
+  (let ((default-config-options-fn
+         (map-elt (agent-shell-openai-make-codex-config) :default-config-options)))
+
+    (let ((agent-shell-openai-default-config-options nil))
+      (should (null (funcall default-config-options-fn))))
+
+    (let ((agent-shell-openai-default-config-options
+           '(("model" . "gpt-5.4")
+             ("reasoning_effort" . "high"))))
+      (should (equal (funcall default-config-options-fn)
+                     '(("model" . "gpt-5.4")
+                       ("reasoning_effort" . "high")))))))
+
 (ert-deftest agent-shell-openai-default-session-mode-id-test ()
   "Test that Codex config exposes default session mode id."
   (let ((default-session-mode-id-fn

@@ -89,13 +89,23 @@ its recorded schema."
     (let ((schema (copy-tree agent-shell-elicitation-tests--schema t)))
       (setf (map-elt schema 'required) required)
       (should (map-elt (agent-shell--normalize-elicitation schema) :reason))))
-  (dolist (constraint '((minLength . 1) (pattern . "x") (format . "email") (default . "x") (allOf . []) ($ref . "x")))
+  (dolist (constraint '((minLength . 1) (pattern . "x") (format . "email") (allOf . []) ($ref . "x")))
     (let ((schema (copy-tree agent-shell-elicitation-tests--schema t)))
       (push constraint (cdr (assq 'text (map-elt schema 'properties))))
       (should (map-elt (agent-shell--normalize-elicitation schema) :reason)))))
 
+(ert-deftest agent-shell-phase2-valid-default-values ()
+  "Accept valid defaults without accepting unsupported constraints."
+  (let ((model (agent-shell--normalize-elicitation
+                '((type . "object")
+                  (properties . ((text . ((type . "string") (default . "seed")))
+                                 (count . ((type . "integer") (minimum . 1) (maximum . 5) (default . 3)))))))))
+    (should-not (map-elt model :reason))
+    (should-not (agent-shell--elicitation-invalid-field model '((text . "seed") (count . 3))))
+    (should (agent-shell--elicitation-invalid-field model '((count . 6))))))
+
 (ert-deftest agent-shell-phase2-other-metadata ()
-  "Normalize both providers, reject malformed and exclusive required branches."
+  "Normalize both providers and validate linked required alternatives."
   (dolist (meta '(((_askUserQuestionCustomAnswer . ((questionId . "q") (isCustomAnswer . t))))
                   ((codex . ((questionId . "q") (isOtherAnswer . t) (isSecret . :false))))
                   ((_askUserQuestionCustomAnswer . ((questionId . "q")))
@@ -106,10 +116,12 @@ its recorded schema."
              (schema `((type . "object") (properties . ,(if reverse (reverse properties) properties)))))
         (should-not (map-elt (agent-shell--normalize-elicitation schema) :reason))
         (dolist (required '(["q"] ["other"] ["q" "other"]))
-          (should (eq 'required-exclusive-branch
-                      (map-elt (agent-shell--normalize-elicitation (cons (cons 'required required) schema)) :reason)))))))
+          (let ((model (agent-shell--normalize-elicitation (cons (cons 'required required) schema))))
+            (should-not (map-elt model :reason))
+            (should (agent-shell--elicitation-invalid-field model nil))
+            (should-not (agent-shell--elicitation-invalid-field model '((q . "Exact"))))
+            (should-not (agent-shell--elicitation-invalid-field model '((other . "Typed")))))))))
   (dolist (meta '(((codex . ((questionId . "q") (isOtherAnswer . :false))))
-                  ((codex . ((questionId . "missing") (isOtherAnswer . t))))
                   ((_askUserQuestionCustomAnswer . ((questionId . "q")))
                    (codex . ((questionId . "different") (isOtherAnswer . t))))
                   ((codex . ((isSecret . "yes"))))
@@ -594,6 +606,101 @@ MODE selects option, other, or text entry.  Values are synthetic."
           (ignore-errors (acp-shutdown :client client))
           (dolist (log (list (acp-traffic-buffer :client client) (acp-logs-buffer :client client)))
             (when (buffer-live-p log) (kill-buffer log))))))))
+
+;;; Upstream contracts, exercised through the strict form implementation.
+
+(ert-deftest agent-shell-elicitation-recognises-a-questionnaire-test ()
+  (should (agent-shell-elicitation--questionnaire-p
+           '((questions . [((question . "Which colour?"))]))))
+  (dolist (input '(nil ((questions . [])) ((command . "ls"))
+                   ((questions . [((label . "Not a question"))]))
+                   ((questions . [((question . 42))]))))
+    (should-not (agent-shell-elicitation--questionnaire-p input))))
+
+(ert-deftest agent-shell-elicitation-pending-form-owns-the-questions-test ()
+  (agent-shell-elicitation-tests--call
+   nil
+   (lambda (state)
+     (let* ((entry (car (map-elt state :elicitations)))
+            (record (cdr entry)))
+       (agent-shell--elicitation-put! record :tool-call-id "ask-1")
+       (should (agent-shell-elicitation--pending-for-tool-call-p
+                :state state :tool-call-id "ask-1"))
+       (should-not (agent-shell-elicitation--pending-for-tool-call-p
+                    :state state :tool-call-id "other"))
+       (agent-shell-elicitation-tests--cancel state (car entry))
+       (should-not (agent-shell-elicitation--pending-for-tool-call-p
+                    :state state :tool-call-id "ask-1"))))))
+
+(ert-deftest agent-shell-elicitation-clear-drops-settled-forms-test ()
+  (let* ((client (list (cons :closed nil)))
+         (pending `((:status . pending) (:client . ,client)))
+         (state `((:client . ,client)
+                  (:elicitations . ((1 . ,pending) (2 . ((:status . accepted)))))
+                  (:elicitation-terminal-ids . (sent-request))
+                  (:active-requests . (((:method . "elicitation/create") (:request-id . 1))
+                                       ((:method . "elicitation/create") (:request-id . 2))
+                                       ((:method . "session/prompt") (:request-id . 3)))))))
+    (agent-shell-elicitation--clear :state state)
+    (should (equal '(1) (map-keys (map-elt state :elicitations))))
+    (should (= 2 (length (map-elt state :active-requests))))
+    (should (equal '(sent-request) (map-elt state :elicitation-terminal-ids)))))
+
+(ert-deftest agent-shell-elicitation-schema-keeps-property-order-and-required-test ()
+  (let* ((model (agent-shell--normalize-elicitation
+                 '((type . "object") (required . ["b"])
+                   (properties . ((a . ((type . "string")))
+                                  (b . ((type . "string"))))))))
+         (fields (map-elt model :fields)))
+    (should (equal '(a b) (mapcar (lambda (field) (map-elt field :name)) fields)))
+    (should (equal '(b) (map-elt model :required)))))
+
+(ert-deftest agent-shell-elicitation-parse-schema-covers-every-variant-test ()
+  "Normalize upstream field variants without weakening schema validation."
+  (dolist (spec '(((type . "boolean")) ((type . "number"))
+                  ((type . "integer")) ((type . "string") (default . "a"))
+                  ((type . "string") (enum . ["a" "b"]))
+                  ((type . "array") (items . ((enum . ["a" "b"]))))))
+    (let ((model (agent-shell--normalize-elicitation
+                  `((type . "object") (properties . ((value . ,spec)))))))
+      (should-not (map-elt model :reason))
+      (should (= 1 (length (map-elt model :fields)))))))
+
+(ert-deftest agent-shell-elicitation-numeric-input-is-corrected-not-coerced-test ()
+  (let* ((model (agent-shell--normalize-elicitation
+                 '((type . "object")
+                   (properties . ((count . ((type . "integer") (minimum . 1) (maximum . 5))))))))
+         (field (car (map-elt model :fields)))
+         (inputs '("bad" "2.5" "10" "3")))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _) (prog1 (car inputs) (setq inputs (cdr inputs))))))
+      (should (= 3 (agent-shell--elicitation-read-value field "Count: " nil 'edit))))))
+
+(ert-deftest agent-shell-elicitation-parses-an-option-preview-test ()
+  (let* ((option '((const . "a") (title . "Approach A")
+                   (_meta . ((_claude/askUserQuestionOption . ((preview . "Preview text")))))))
+         (normalized (agent-shell--elicitation-option option)))
+    (should (equal "Preview text" (agent-shell-elicitation--option-preview option)))
+    (should (equal "Preview text" (map-elt normalized :preview))))
+  (should-error
+   (agent-shell--elicitation-option
+    '((const . "a") (_meta . ((_claude/askUserQuestionOption . ((preview . 12)))))))
+   :type 'agent-shell-elicitation-unsupported))
+
+(ert-deftest agent-shell-elicitation-preview-opens-and-closes-test ()
+  (agent-shell-elicitation-tests--call
+   '((type . "object")
+     (properties . ((choice . ((type . "string")
+                              (oneOf . [((const . "a") (title . "Approach A")
+                                         (_meta . ((_claude/askUserQuestionOption .
+                                                  ((preview . "Long preview body"))))))]))))))
+   (lambda (state)
+     (should-not (string-search "Long preview body" (buffer-string)))
+     (funcall (agent-shell-elicitation-tests--button "Approach A" "p"))
+     (should (string-search "Long preview body" (buffer-string)))
+     (should-not (acp-fakes-sent-responses (map-elt state :client)))
+     (funcall (agent-shell-elicitation-tests--button "Approach A" "p"))
+     (should-not (string-search "Long preview body" (buffer-string))))))
 
 (provide 'agent-shell-elicitation-tests)
 ;;; agent-shell-elicitation-tests.el ends here

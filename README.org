@@ -17,9 +17,9 @@ Thank you!
 
 * agent-shell
 
-A native Emacs shell to interact with LLM agents powered by ACP ([[https://agentclientprotocol.com][Agent Client Protocol]]).
+=agent-shell= brings your favorite AI agents to [[https://www.gnu.org/software/emacs/][Emacs]], keeping you at home: familiar buffers and bindings, no terminal emulation. All powered by ACP, the [[https://agentclientprotocol.com][Agent Client Protocol]].
 
-With agent-shell, you can interact with any ACP-driven agent like:
+Works with 23 agents today, and any other that speaks ACP:
 
 - [[https://code.claude.com/docs/en/overview][Claude Agent]] (Anthropic)
 - [[https://github.com/agentclientprotocol/codex-acp][Codex]] (OpenAI)
@@ -27,17 +27,24 @@ With agent-shell, you can interact with any ACP-driven agent like:
 - [[https://goose-docs.ai/docs/getting-started/installation][Goose]]
 - [[https://docs.x.ai/docs/overview][Grok Build]] (xAI)
 - [[https://cursor.com/docs/cli][Cursor]]
+- [[https://docs.cline.bot/usage/acp][Cline]]
+- [[https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server][GitHub Copilot]]
 - [[https://www.kimi.com/code][Kimi Code CLI]]
 - [[https://www.codebuddy.ai][CodeBuddy]]
+- [[https://github.com/deepseek-ai/deepseek-harness][DeepSeek Harness]]
 - [[https://kiro.dev][Kiro CLI]]
+- [[https://qoder.com][Qoder CLI]]
 - [[https://github.com/QwenLM/qwen-code][Qwen Code]]
 - [[https://docs.augmentcode.com/cli/overview][Auggie]]
 - [[https://github.com/mistralai/mistral-vibe][Mistral Vibe]]
 - [[https://factory.ai][Factory Droid]]
 - [[https://github.com/svkozak/pi-acp][Pi]]
 - [[https://github.com/can1357/oh-my-pi][Oh My Pi]]
-- [[https://opencode.ai][Opencode]]
+- [[https://github.com/NousResearch/hermes-agent][Hermes]]
+- [[https://opencode.ai][OpenCode]]
+- [[https://openclaw.ai][OpenClaw]]
 - [[https://antigravity.google/docs/ide/extensions][Antigravity]] (Google)
+- [[https://junie.jetbrains.com/docs/junie-cli-acp.html][Junie]] (JetBrains)
 
 [[https://www.youtube.com/watch?v=R2Ucr3amgGg][agent-shell - YouTube]]
 
@@ -88,6 +95,7 @@ We now have a handful of additional packages to extend the =agent-shell= experie
 - [[https://github.com/ElleNajt/meta-agent-shell][meta-agent-shell]]: Multi-agent coordination system for =agent-shell= with inter-agent communication, task tracking, and project-level dispatching.
 - [[https://github.com/cxa/agent-shell-macext][agent-shell-macext]]: macOS-specific enhancements for =agent-shell=.
 - [[https://github.com/lllShamanlll/agent-shell-org-transcript][agent-shell-org-transcript]]: Org-mode transcripts for =agent-shell= sessions, with org-roam integration.
+- [[https://github.com/lllShamanlll/agent-shell-org-config][agent-shell-org-config]]: Keep =agent-shell= agent, project, and skill definitions in org-roam.
 - [[https://github.com/eddof13/ob-agent-shell][ob-agent-shell]]: Org Babel backend for executing =agent-shell= source blocks.
 - [[https://github.com/Marx-A00/agent-recall][agent-recall]]: Search, browse, and resume =agent-shell= conversation transcripts.
 - [[https://github.com/lgmoneda/agent-shell-pet][agent-shell-pet]]: Codex-like pets that broadcast agent-shell session states.
@@ -100,8 +108,11 @@ We now have a handful of additional packages to extend the =agent-shell= experie
 - [[https://github.com/SreenivasVRao/agent-shell-hq][agent-shell-hq]]: A heads-up display and peek interface for managing multiple =agent-shell= sessions, organized by project.
 - [[https://github.com/Jamie-Cui/agent-shell-permission-transient][agent-shell-permission-transient]]: A compact Transient interface for responding to queued agent-shell permission requests.
 - [[https://github.com/tychoish/agent-shell-queue][agent-shell-queue]]: A flexible prompt/shell queue for =agent-shell= sessions.
+- [[https://github.com/mrcnski/agent-shell-queue-transient][agent-shell-queue-transient]]: A Transient interface for the prompt queue in =agent-shell=.
+- [[https://github.com/izeigerman/agent-shell-gc][agent-shell-gc]]: Garbage collection for =agent-shell=.
 
 * Articles
+- Enzuru: [[https://enzuru.medium.com/emacs-in-fifty-keystrokes-five-years-later-2026-edition-featuring-meow-and-agent-shell-3d656f273989?source=friends_link&sk=4e1a8ba56819a67c1798cc34b40b8a29][Emacs in fifty keystrokes five years later (2026 edition featuring meow and agent-shell)]].
 - 20Y: [[https://20y.hu/~slink/journal/agent-shell/index.html][Agentic development workflow in Emacs]]
 - Skye: [[https://skyefreeman.com/blog/2026/04/15/how-im-using-llms-with-emacs][How I'm using LLM's via Emacs]].
 - sincebyte: [[https://neoemacs.com/posts/agent-shell-cursor-agent-cli/][Agent Shell Cursor Agent Cli]].
@@ -187,6 +198,35 @@ codebuddy --acp
 
 See https://www.codebuddy.ai/docs/zh/ide/Getting-Started/Installation for details.
 
+*** DeepSeek Harness
+
+For DeepSeek Harness, install with:
+
+#+begin_src bash
+npm install -g @deepseek-ai/dsh
+#+end_src
+
+The ACP server reads your API key from =DEEPSEEK_API_KEY=.  If Emacs
+does not inherit it from your shell, set it via
+=agent-shell-deepseek-authentication=:
+
+#+begin_src emacs-lisp
+(setq agent-shell-deepseek-authentication
+      (agent-shell-deepseek-make-authentication :api-key "your-key"))
+#+end_src
+
+See https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/acp/acp/README.md for details.
+
+*** Junie
+
+For Junie, install the [[https://junie.jetbrains.com/docs/junie-cli.html][Junie CLI]] and ensure ACP mode is available:
+
+#+begin_src bash
+junie --acp true
+#+end_src
+
+See https://junie.jetbrains.com/docs/junie-cli-acp.html for details.
+
 *** Kiro CLI
 
 For Kiro CLI, install with:
@@ -196,6 +236,27 @@ curl -fsSL https://cli.kiro.dev/install | bash
 #+end_src
 
 See https://kiro.dev/docs/cli/acp/ for details.
+
+*** Qoder CLI
+
+Install Qoder CLI following the [[https://docs.qoder.com/cli/installation][Qoder installation instructions]],
+then log in once:
+
+#+begin_src bash
+qoder login
+#+end_src
+
+Qoder CLI includes an ACP server.  Start it from =agent-shell= with
+=M-x agent-shell-qoder-start-agent=; the backend launches:
+
+#+begin_src bash
+qoder --acp
+#+end_src
+
+Qoder uses the CLI's existing login state, so a Qoder subscription can be used
+without configuring a separate model API key.  For non-interactive
+authentication, set =QODER_PERSONAL_ACCESS_TOKEN=...= in
+=agent-shell-qoder-environment=.  See the [[https://docs.qoder.com/cli/acp][Qoder ACP documentation]].
 
 *** Qwen Code
 
@@ -295,7 +356,20 @@ Alternatively, you can bootstrap the antigravity tool with the following functio
 
 See https://antigravity.google/docs/ide/extensions for details.
 
-*** Opencode + local ollama models
+*** OpenClaw
+
+For OpenClaw, install with:
+
+#+begin_src bash
+curl -fsSL https://openclaw.ai/install.sh | bash
+#+end_src
+
+The =openclaw acp= bridge requires a running gateway.  Start one with
+=openclaw gateway start= (verify with =openclaw gateway status=).
+
+See https://docs.openclaw.ai/start/getting-started for details.
+
+*** OpenCode + local ollama models
 
 For opencode coding agent, install with:
 
@@ -671,7 +745,7 @@ For API key authentication:
 		   (shell-command-to-string "source ~/.vibe/.env; echo $MISTRAL_API_KEY")))))
 #+end_src
 
-*** Opencode + local ollama Qwen2.5
+*** OpenCode + local ollama Qwen2.5
 
 If ~opencode~ is not found by ~agent-shell~, you can add it to the search path
 
@@ -757,9 +831,23 @@ In view mode, use =r= to compose a reply, =R= to quote the response in a reply, 
 Do not invoke =agent-shell-viewport-edit-mode= or =agent-shell-viewport-view-mode= directly in an agent shell buffer.  They are major modes installed by the entry points above on the separate viewport buffer, not commands for converting the shell buffer.
 #+end_quote
 
+*** Typing while the agent is busy
+
+When =agent-shell-persistent-prompt-enabled= is set, the shell keeps a writable prompt at the end of the buffer at all times (including agent busy times).
+
+Submitting into a busy agent queues the prompt by default.  =RET= submits via =agent-shell-busy-submit-default-function= (queues), while =M-RET= and =C-u RET= submit via =agent-shell-busy-submit-override-function= (steers).  Steering is covered in the next section.
+
+To disable/hide the persistent prompt, unset the related option:
+
+#+begin_src emacs-lisp
+(setopt agent-shell-persistent-prompt-enabled nil)
+#+end_src
+
+The viewport's compose buffer is available either way, and submitting from it mid-turn routes the same.
+
 *** Steering a running turn
 
-A prompt sent while the agent is working is queued and submitted once the turn ends.  Agents that support steering can take it into the turn already running instead, so a wrong direction can be corrected without waiting for it to finish.  Steering is an ACP extension (=_session/steering=) rather than part of the spec, advertised by the agent at initialization: the Claude and Codex packages implement it, other agents keep queueing.
+A prompt sent while the agent is working is queued and submitted once the turn ends.  Prompts queued during the same turn are merged into a single prompt, separated by blank lines (set =agent-shell-prompt-queue-merge= to nil to send them one turn each).  Cancelling the turn asks whether to continue with the queued prompts.  Agents that support steering can take it into the turn already running instead, so a wrong direction can be corrected without waiting for it to finish.  Steering is an ACP extension (=_session/steering=) rather than part of the spec, advertised by the agent at initialization: the Claude and Codex packages implement it, other agents keep queueing.
 
 Steering is always explicit.  =M-x agent-shell-prompt-queue= queues, as it always has.  =M-x agent-shell-prompt-steer= steers the running turn, and errors when the agent cannot steer.  With no turn running there is nothing to steer into, so it submits the prompt instead.  When the agent declines a steer, the running turn is interrupted and the shell says so, rather than letting the agent carry on in a direction you believe you already corrected.
 
@@ -780,7 +868,10 @@ Start a specific agent shell session directly:
 - =M-x agent-shell-goose-start-agent= - Start a Goose agent session
 - =M-x agent-shell-xai-start-grok= - Start a Grok Build (xAI) agent session
 - =M-x agent-shell-cursor-start-agent= - Start a Cursor agent session
+- =M-x agent-shell-deepseek-start-agent= - Start a DeepSeek Harness agent session
+- =M-x agent-shell-junie-start-agent= - Start a Junie agent session
 - =M-x agent-shell-kiro-start-agent= - Start a Kiro CLI agent session
+- =M-x agent-shell-qoder-start-agent= - Start a Qoder CLI agent session
 - =M-x agent-shell-mistral-start-vibe= - Start a Mistral Vibe agent session
 - =M-x agent-shell-qwen-start= - Start a Qwen Code agent session
 - =M-x agent-shell-droid-start-agent= - Start a Factory Droid agent session
@@ -811,6 +902,29 @@ configurations across every agent that you use.
            (type . "http")
            (headers . [])
            (url . "https://mcp.notion.com/mcp"))))
+#+end_src
+
+*** Monitoring events
+
+You can subscribe to shell events (turn complete, tool calls, config changes, etc.) via =agent-shell-subscribe-to=. See its docstring (=C-h f agent-shell-subscribe-to=) for the full list of events and their data.
+
+For example, to have new OpenCode shells remember the last model and effort level chosen (within your Emacs session):
+
+#+begin_src emacs-lisp
+  (add-hook 'agent-shell-mode-hook
+            (lambda ()
+              (agent-shell-subscribe-to
+               :shell-buffer (current-buffer)
+               :event 'config-option-update
+               :on-event
+               (lambda (event)
+                 (pcase (map-elt (agent-shell-get-config (current-buffer)) :identifier)
+                   ('opencode
+                    (setq agent-shell-opencode-default-config-options
+                          (seq-map (lambda (option)
+                                     (cons (map-elt option :id)
+                                           (map-elt option :current-value)))
+                                   (map-nested-elt event '(:data :config-options))))))))))
 #+end_src
 
 ** Running agents in Devcontainers / Docker containers (Experimental)
@@ -895,6 +1009,12 @@ You can send a screenshot from your clipboard to your shell with =agent-shell-se
 - =xclip= for Xorg,
 - =pngpaste= for MacOS.
 - =powershell= for Windows.
+
+Alternatively, =M-x yank-media= pastes a clipboard image with no external programs, where your Emacs build can read images off the clipboard.
+
+*** Dragging files in
+
+Drag a file from your file manager (or =dired=) onto a shell or viewport buffer to attach it to the prompt, the same way a pasted image is. Images get a preview; any other file is attached as an =@path= link.
 
 *** Inhibiting minor modes during file writes
 
@@ -1023,6 +1143,9 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-auggie-environment                | Environment variables for the Auggie client.                                    |
 | agent-shell-buffer-name-format                | Format to use when generating agent shell buffer names.                         |
 | agent-shell-busy-indicator-frames             | Frames for the busy indicator animation.                                        |
+| agent-shell-busy-submit-default-function      | Function deciding what submitting while the agent is working does.              |
+| agent-shell-busy-submit-override-function     | Function M-x agent-shell-submit-override submits through.                       |
+| agent-shell-chat-label-function               | Function returning a chat label ("Me" or the agent's name).                     |
 | agent-shell-chat-mode-enabled                 | Whether a new agent shell enables ‘agent-shell-chat-mode’ by default.           |
 | agent-shell-chat-mode-hook                    | Hook run after entering or leaving ‘agent-shell-chat-mode’.                     |
 | agent-shell-cline-acp-command                 | Command and parameters for the Cline agent client.                              |
@@ -1032,6 +1155,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-clipboard-image-handlers          | Handlers for saving clipboard images to a file.                                 |
 | agent-shell-codebuddy-acp-command             | Command and parameters for the CodeBuddy agent client.                          |
 | agent-shell-codebuddy-environment             | Environment variables for the CodeBuddy agent client.                           |
+| agent-shell-command-completion-enabled        | Non-nil pops agent command completion as / is typed.                            |
 | agent-shell-command-prefix                    | Prefix to apply when executing agent commands and shell commands.               |
 | agent-shell-completion-mode-hook              | Hook run after entering or leaving ‘agent-shell-completion-mode’.               |
 | agent-shell-confirm-interrupt                 | Whether to prompt for confirmation before interrupting.                         |
@@ -1041,6 +1165,10 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-cursor-authentication             | Configuration for Cursor authentication.                                        |
 | agent-shell-cursor-environment                | Environment variables for the Cursor agent client.                              |
 | agent-shell-cwd-function                      | When non-nil, a function called to determine the shell’s CWD.                   |
+| agent-shell-deepseek-acp-command              | Command and parameters for the DeepSeek Harness ACP server.                     |
+| agent-shell-deepseek-authentication           | Configuration for DeepSeek Harness authentication.                              |
+| agent-shell-deepseek-default-config-options   | Default DeepSeek Harness config options, applied at session start.              |
+| agent-shell-deepseek-environment              | Environment variables for the DeepSeek Harness ACP server.                      |
 | agent-shell-display-action                    | Display action for agent shell buffers.                                         |
 | agent-shell-dot-subdir-function               | Function used by ‘agent-shell--dot-subdir’ to resolve subdirectory paths.       |
 | agent-shell-droid-acp-command                 | Command and parameters for the Factory Droid ACP client.                        |
@@ -1050,7 +1178,7 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-droid-default-session-mode-id     | Default Droid AI session mode ID.                                               |
 | agent-shell-droid-environment                 | Environment variables for the Factory Droid ACP client.                         |
 | agent-shell-embed-file-size-limit             | Maximum file size in bytes for embedding with ContentBlock::Resource.           |
-| agent-shell-file-completion-enabled           | Non-nil automatically enables file completion when starting shells.             |
+| agent-shell-file-completion-enabled           | Non-nil pops project file completion as @ is typed.                             |
 | agent-shell-file-display-action               | Display action for files opened from a link, image, or ‘@file’ mention.         |
 | agent-shell-github-acp-command                | Command and parameters for the GitHub Copilot agent client.                     |
 | agent-shell-github-default-model-id           | Default GitHub Copilot model ID.                                                |
@@ -1068,6 +1196,10 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-hermes-environment                | Environment variables for the Hermes agent client.                              |
 | agent-shell-highlight-blocks                  | Whether or not to highlight source blocks.                                      |
 | agent-shell-inhibit-system-sleep              | Non-nil to keep the system awake while an agent is busy.                        |
+| agent-shell-junie-acp-command                 | Command and parameters for the JetBrains Junie ACP client.                      |
+| agent-shell-junie-default-model-id            | Default Junie model ID.                                                         |
+| agent-shell-junie-default-session-mode-id     | Default Junie session mode ID.                                                  |
+| agent-shell-junie-environment                 | Environment variables for the Junie ACP client.                                 |
 | agent-shell-kimi-acp-command                  | Command and parameters for the Kimi Code CLI client.                            |
 | agent-shell-kimi-default-model-id             | Default Kimi model ID.                                                          |
 | agent-shell-kimi-default-session-mode-id      | Default Kimi Code session mode ID.                                              |
@@ -1090,34 +1222,42 @@ always go to Evil modes if you need to with ~C-z~).
 | agent-shell-openai-authentication             | Configuration for OpenAI authentication.                                        |
 | agent-shell-openai-codex-acp-command          | Command and parameters for the OpenAI Codex client.                             |
 | agent-shell-openai-codex-environment          | Environment variables for the OpenAI Codex client.                              |
+| agent-shell-openai-default-config-options     | Default Codex config options, applied at session start.                         |
 | agent-shell-openai-default-model-id           | Default Codex model ID.                                                         |
 | agent-shell-openai-default-session-mode-id    | Default Codex session mode ID.                                                  |
+| agent-shell-openclaw-acp-command              | Command and parameters for the OpenClaw ACP bridge.                             |
+| agent-shell-openclaw-default-model-id         | Default OpenClaw model ID.                                                      |
+| agent-shell-openclaw-environment              | Environment variables for the OpenClaw client.                                  |
 | agent-shell-opencode-acp-command              | Command and parameters for the OpenCode client.                                 |
 | agent-shell-opencode-authentication           | Configuration for OpenCode authentication.                                      |
+| agent-shell-opencode-default-config-options   | Default OpenCode config options, applied at session start.                      |
 | agent-shell-opencode-default-model-id         | Default OpenCode model ID.                                                      |
 | agent-shell-opencode-default-session-mode-id  | Default OpenCode session mode ID.                                               |
 | agent-shell-opencode-environment              | Environment variables for the OpenCode client.                                  |
 | agent-shell-outgoing-request-decorator        | Function to decorate outgoing ACP requests before they are sent.                |
 | agent-shell-path-resolver-function            | Function for resolving remote paths on the local file-system, and vice versa.   |
 | agent-shell-permission-icon                   | Icon displayed when shell commands require permission to execute.               |
+| agent-shell-persistent-prompt-enabled         | Whether a shell keeps a writable prompt at the buffer end at all times.         |
 | agent-shell-pi-acp-command                    | Command and parameters for the Pi ACP client.                                   |
 | agent-shell-pi-environment                    | Environment variables for the Pi client.                                        |
 | agent-shell-prefer-viewport-interaction       | Non-nil makes ‘agent-shell’ prefer viewport interaction over shell interaction. |
 | agent-shell-preferred-agent-config            | Default agent to use for all new shells.                                        |
-| agent-shell-prompt-bar-input-mode-hook        | Hook run after entering or leaving ‘agent-shell-prompt-bar-input-mode’.         |
-| agent-shell-prompt-bar-mode                   | Non-nil if Agent-Shell-Prompt-Bar mode is enabled.                              |
-| agent-shell-prompt-bar-mode-hook              | Hook run after entering or leaving ‘agent-shell-prompt-bar-mode’.               |
+| agent-shell-prompt-busy-frames                | Frames animating the live prompt’s marker while the agent works.                |
+| agent-shell-qoder-acp-command                 | Command and parameters for the Qoder CLI ACP server.                            |
+| agent-shell-qoder-environment                 | Environment variables for the Qoder CLI ACP server.                             |
 | agent-shell-qwen-acp-command                  | Command and parameters for the Qwen Code client.                                |
 | agent-shell-qwen-authentication               | Configuration for Qwen Code authentication.                                     |
 | agent-shell-qwen-environment                  | Environment variables for the Qwen Code client.                                 |
 | agent-shell-screenshot-command                | The program to use for capturing screenshots.                                   |
 | agent-shell-section-functions                 | Abnormal hook run after overlays are applied (experimental).                    |
 | agent-shell-session-choices-function          | Function to transform the choices offered when starting a shell.                |
+| agent-shell-session-list-page-limit           | Maximum number of pages to request when listing sessions.                       |
 | agent-shell-session-restore-verbosity         | How much prior context to show when restoring a session.                        |
 | agent-shell-session-strategy                  | How to handle sessions when starting a new shell.                               |
 | agent-shell-show-busy-indicator               | Non-nil to show the busy indicator animation in the header and mode line.       |
 | agent-shell-show-config-icons                 | Whether to show icons in agent config selection.                                |
 | agent-shell-show-context-usage-indicator      | Whether and how to show the context usage indicator.                            |
+| agent-shell-show-cost-indicator               | Whether to show the session’s cumulative cost in the header.                    |
 | agent-shell-show-session-id                   | Non-nil to display the session ID in the header and session selection.          |
 | agent-shell-show-usage-at-turn-end            | Whether to display usage information when agent turn ends.                      |
 | agent-shell-show-welcome-message              | Non-nil to show welcome message.                                                |
@@ -1191,15 +1331,15 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-clear-buffer                                | Clear the current shell buffer.                                               |
 |                                                       | agent-shell-cline-start-agent                           | Start an interactive Cline agent shell.                                       |
 |                                                       | agent-shell-codebuddy-start-agent                       | Start an interactive CodeBuddy agent shell.                                   |
-|                                                       | agent-shell-completion-mode                             | Toggle agent shell completion with @ or / prefix.                             |
+|                                                       | agent-shell-completion-mode                             | Toggle popping completion as @ or / are typed.                                |
 |                                                       | agent-shell-copy-as-markdown                            | Copy the region between BEG and END to the kill ring as markdown.             |
 |                                                       | agent-shell-copy-last-output                            | Copy the last agent output to the kill ring.                                  |
 |                                                       | agent-shell-copy-link-url-at-point                      | Copy the rendered Markdown link URL at POS (or point) to the kill ring.       |
-|                                                       | agent-shell-copy-output                                 | Copy the shell output to the kill ring.                                       |
 |                                                       | agent-shell-copy-session-id                             | Copy the current session ID to the kill ring.                                 |
 |                                                       | agent-shell-copy-source-block-at-point                  | Copy the rendered fenced code block body at POS (or point) to the kill ring.  |
 |                                                       | agent-shell-cursor-start-agent                          | Start an interactive Cursor agent shell.                                      |
 | C-<tab>                                               | agent-shell-cycle-session-mode                          | Cycle through available session modes for the current `agent-shell' session.  |
+|                                                       | agent-shell-deepseek-start-agent                        | Start an interactive DeepSeek Harness agent shell.                            |
 |                                                       | agent-shell-delete-interaction-at-point                 | Delete interaction (request and response) at point.                           |
 |                                                       | agent-shell-diff-accept-all                             | Accept all changes in the current diff buffer.                                |
 |                                                       | agent-shell-diff-mode                                   | Major mode for `agent-shell' diff buffers.                                    |
@@ -1220,6 +1360,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-insert-shell-command-output                 | Execute a shell command and insert output as a code block.                    |
 | C-c C-c                                               | agent-shell-interrupt                                   | Interrupt in-progress request and reject all pending permissions.             |
 |                                                       | agent-shell-jump-to-latest-permission-button-row        | Jump to the latest permission button row.                                     |
+|                                                       | agent-shell-junie-start-agent                           | Start an interactive Junie agent shell.                                       |
 |                                                       | agent-shell-kimi-start-agent                            | Start an interactive Kimi Code agent shell.                                   |
 |                                                       | agent-shell-kiro-start-agent                            | Start an interactive Kiro agent shell.                                        |
 |                                                       | agent-shell-list-edit-dedent-line                       | De-indent the current list item.                                              |
@@ -1249,20 +1390,19 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-omp-start                                   | Start an interactive Oh My Pi (omp) agent shell.                              |
 |                                                       | agent-shell-open-transcript                             | Open the transcript file for the current `agent-shell' buffer.                |
 |                                                       | agent-shell-openai-start-codex                          | Start an interactive Codex agent shell.                                       |
+|                                                       | agent-shell-openclaw-start-agent                        | Start an interactive OpenClaw agent shell.                                    |
 |                                                       | agent-shell-opencode-start-agent                        | Start an interactive OpenCode agent shell.                                    |
 | C-c C-o                                               | agent-shell-other-buffer                                | Switch to other associated buffer (viewport vs shell).                        |
 |                                                       | agent-shell-pi-start-agent                              | Start an interactive Pi coding agent shell.                                   |
 | C-<up> or M-p                                         | agent-shell-previous-input                              | Cycle backwards through input history, saving input.                          |
 | p or <backtab>                                        | agent-shell-previous-item                               | Go to previous item.                                                          |
 |                                                       | agent-shell-previous-permission-button                  | Jump to the previous button.                                                  |
-|                                                       | agent-shell-prompt-bar-input-mode                       | Minor mode for the `agent-shell' prompt bar input buffer.                     |
-|                                                       | agent-shell-prompt-bar-mode                             | Toggle an in-frame prompt bar glued below every `agent-shell' window.         |
-|                                                       | agent-shell-prompt-bar-submit                           | Submit the bar's prompt to its shell, or queue it when busy.                  |
 |                                                       | agent-shell-prompt-compose                              | Compose an `agent-shell' prompt in a dedicated buffer.                        |
 |                                                       | agent-shell-prompt-queue                                | Queue or immediately send a prompt depending on shell busy state.             |
 |                                                       | agent-shell-prompt-queue-remove                         | Remove all pending prompts or a specific prompt by REMOVE-INDEX.              |
 |                                                       | agent-shell-prompt-queue-resume                         | Resume processing pending prompts in the queue.                               |
 |                                                       | agent-shell-prompt-steer                                | Steer PROMPT into the turn the agent is currently running.                    |
+|                                                       | agent-shell-qoder-start-agent                           | Start an interactive Qoder agent shell.                                       |
 | r                                                     | agent-shell-quote-region                                | Quote the active region into the shell's latest prompt.                       |
 |                                                       | agent-shell-qwen-start                                  | Start an interactive Qwen Code CLI agent shell.                               |
 |                                                       | agent-shell-reload                                      | Reload the current session by restarting with the same session ID.            |
@@ -1271,6 +1411,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-restart                                     | Clear conversation by restarting the agent shell in the same project.         |
 |                                                       | agent-shell-resume-session                              | Resume an existing agent session by SESSION-ID.                               |
 |                                                       | agent-shell-run-all-tests                               | Run all agent-shell tests in batch mode.                                      |
+|                                                       | agent-shell-save-traffic                                | Save agent shell traffic to a .traffic file and reveal it in `dired'.         |
 | M-r                                                   | agent-shell-search-history                              | Search previous input history.                                                |
 |                                                       | agent-shell-send-clipboard-image                        | Paste clipboard image and insert it into `agent-shell'.                       |
 |                                                       | agent-shell-send-clipboard-image-to                     | Like `agent-shell-send-clipboard-image' but prompt for which shell to use.    |
@@ -1288,7 +1429,8 @@ always go to Evil modes if you need to with ~C-z~).
 | C-c C-v                                               | agent-shell-set-session-model                           | Set session model.                                                            |
 | C-c C-t                                               | agent-shell-set-session-thought-level                   | Set thought level (reasoning effort) for the current session.                 |
 |                                                       | agent-shell-show-usage                                  | Display current session usage information in the minibuffer.                  |
-| RET                                                   | agent-shell-submit                                      | Submit the current input to the agent.                                        |
+| RET                                                   | agent-shell-submit                                      | Submit the current input to the agent, or queue it while the agent is busy.   |
+| M-<return> or M-RET                                   | agent-shell-submit-override                             | Submit the current input through the override route.                          |
 |                                                       | agent-shell-switch-buffer                               | Switch to another `agent-shell-mode' buffer via `completing-read'.            |
 |                                                       | agent-shell-toggle                                      | Toggle agent shell display.                                                   |
 |                                                       | agent-shell-toggle-logging                              | Toggle logging.                                                               |
@@ -1309,6 +1451,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-viewport-compose-send-and-dismiss           | Queue or send the composed prompt, then dismiss the compose window.           |
 |                                                       | agent-shell-viewport-compose-send-and-kill              | Send the viewport composed prompt to the agent shell and kill compose buffer. |
 |                                                       | agent-shell-viewport-compose-send-and-wait-for-response | Send the viewport composed prompt and display response in viewport.           |
+|                                                       | agent-shell-viewport-compose-send-override              | Send the viewport composed prompt through the override route.                 |
 |                                                       | agent-shell-viewport-copy-session-id                    | Copy the current session ID to the kill ring.                                 |
 |                                                       | agent-shell-viewport-cycle-session-mode                 | Cycle through available session modes.                                        |
 |                                                       | agent-shell-viewport-edit-mode                          | Major mode for composing agent shell prompts.                                 |
@@ -1340,6 +1483,7 @@ always go to Evil modes if you need to with ~C-z~).
 |                                                       | agent-shell-viewport-reply-continue                     | Reply with "continue" and send immediately.                                   |
 |                                                       | agent-shell-viewport-reply-more                         | Reply with "more" and send immediately.                                       |
 |                                                       | agent-shell-viewport-reply-yes                          | Reply with "yes" and send immediately.                                        |
+|                                                       | agent-shell-viewport-save-traffic                       | Save agent shell traffic to a .traffic file and reveal it in `dired'.         |
 |                                                       | agent-shell-viewport-search-history                     | Search prompt history, select, and insert into compose buffer.                |
 |                                                       | agent-shell-viewport-set-session-mode                   | Set session mode.                                                             |
 |                                                       | agent-shell-viewport-set-session-model                  | Set session model.                                                            |
@@ -1383,6 +1527,32 @@ Could be the agent itself missing an [[https://agentclientprotocol.com][Agent Cl
 
 ** Is shx supported?
 No. There are reports that [[https://github.com/xenodium/agent-shell/issues/543][it does not work]] with agent-shell.
+** Agent hangs at "Loading..." or fails with "Method not found: initialize" over TRAMP?
+
+When =default-directory= is remote, the agent is started on the remote host via TRAMP. By default, TRAMP starts it through its own remote shell, which was reported to hang at "Loading..." in [[https://github.com/xenodium/agent-shell/issues/872][#872]]. Enabling TRAMP's direct asynchronous processes for the host (along with the =direct-async= setting below) resolved it:
+
+#+begin_src emacs-lisp
+  (connection-local-set-profile-variables
+   'remote-direct-async-process
+   '((tramp-direct-async-process . t)))
+
+  (connection-local-set-profiles
+   '(:application tramp :machine "my-host")
+   'remote-direct-async-process)
+#+end_src
+
+For the =ssh=, =scp=, and =rsync= methods, TRAMP runs direct asynchronous processes with =ssh -t -t=, which allocates a remote terminal. In #872, that terminal echoed =agent-shell='s requests back, failing with "Method not found: initialize". The following tells TRAMP to skip =-t -t= for the host:
+
+#+begin_src emacs-lisp
+  (add-to-list 'tramp-connection-properties
+               (list (regexp-quote "/ssh:my-host:") "direct-async" t))
+#+end_src
+
+Direct asynchronous processes don't support interactive authentication (e.g. password prompts), and TRAMP falls back to its default implementation for multi-hop connections. See TRAMP's "Improving performance of asynchronous remote processes" manual section for details.
+
+Agent executables are looked up on the remote host via =tramp-remote-path= (not =exec-path=). If yours isn't found, add its remote directory to =tramp-remote-path= and run =M-x tramp-cleanup-connection=, as TRAMP caches the remote path per connection.
+
+For mapping remote file paths between Emacs and the agent, see [[https://github.com/junyi-hou/agent-shell-tramp][agent-shell-tramp]].
 ** How do I view/get [[https://agentclientprotocol.com][Agent Client Protocol]] traffic?
 
 1. =M-x agent-shell-toggle-logging= (make sure logging is ON).
@@ -1395,7 +1565,7 @@ For example, here's what a [[https://agentclientprotocol.com/protocol/schema#ses
 
 [[file:traffic.png]]
 
-Sometimes including a traffic screenshot in an issue is enough. Other times including the full traffic is needed. From the traffic viewer, you can =M-x acp-traffic-save-to= to save as =.traffic=.
+Sometimes including a traffic screenshot in an issue is enough. Other times including the full traffic is needed. From the shell or viewport, you can =M-x agent-shell-save-traffic= (or =M-x agent-shell-viewport-save-traffic=) to save as =.traffic=. From the traffic viewer itself, =M-x acp-traffic-save-to= does the same.
 
 ** Where should I file bug or feature request?
 

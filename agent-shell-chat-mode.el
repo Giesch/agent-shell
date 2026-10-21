@@ -39,6 +39,8 @@
 
 ;;; Code:
 
+(require 'agent-shell-faces)
+(require 'agent-shell-prompt)
 (require 'map)
 (require 'seq)
 (require 'cl-lib)
@@ -46,11 +48,13 @@
   (require 'subr-x))
 
 (defvar agent-shell-prompt-queue-setup-minibuffer-functions)
+(defvar agent-shell-section-functions)
 
 (declare-function agent-shell-subscribe-to "agent-shell")
 (declare-function agent-shell-unsubscribe "agent-shell")
 
 (defvar agent-shell--state)
+(defvar agent-shell-show-busy-indicator)
 ;; Soft reference: `agent-shell-prompt-bar-mode' may be unbound when the
 ;; prompt bar is not loaded.  Read it with `bound-and-true-p'.
 (defvar agent-shell-prompt-bar-mode)
@@ -66,6 +70,56 @@ When non-nil, starting a shell turns the (global) chat mode on, so that
 shell and any others render as a chat.  Toggling the mode off by hand is
 overridden the next time a shell starts."
   :type 'boolean
+  :group 'agent-shell)
+
+(defcustom agent-shell-prompt-busy-frames
+  '("|" "/" "-" "\\")
+  "Frames animating the live prompt's marker while the agent works.
+A list or vector of strings, drawn in the body indent ahead of the
+marker, a string shown as is, without animating, or a function
+returning either (or nil to show nothing).  For example,
+\\='(\"·\" \"•\" \"●\" \"•\") or \"(busy)\".
+
+Outside `agent-shell-chat-mode', drawn ahead of the shell prompt's
+chevron instead.  For example, \"Claude|> \".
+
+A function takes no arguments and is called in the shell buffer on
+every heartbeat tick, so keep it cheap.  For example, to show
+\"(connecting)\" until the session starts, and \"(busy)\" after:
+
+  (lambda ()
+    (if (agent-shell-session-id) \"(busy)\" \"(connecting)\"))
+
+The body indent fits a single column, so a wider frame (like \"(busy)\")
+is followed by a plain space, pushing the marker right while the agent
+works.
+
+ASCII by default, so the buffer's own font draws them.  Anything a font
+may lack comes from a fallback font instead, which can draw it wider
+than a column or with a taller line, bouncing the prompt as frames
+change.  Braille, the usual spinner, is one such (and may show unraised
+dots)."
+  :type '(choice (string :tag "Static text")
+                 (repeat :tag "Frames" string)
+                 (function :tag "Function"))
+  :group 'agent-shell)
+
+(defcustom agent-shell-chat-label-function #'agent-shell-chat--boxed-label
+  "Function returning a chat label (\"Me\" or the agent's name).
+
+Called with an alist, for example:
+
+  \\='((:text . \"Me\")
+    (:role . user))
+
+:role is `user' for the \"Me\" label and `agent' for the agent's.
+
+Should return a single-line string, propertized as the label is to be
+drawn.  A `display' property is honored, so the label can be drawn as an
+image (e.g. an SVG badge).
+
+See `agent-shell-chat--boxed-label' for the default."
+  :type 'function
   :group 'agent-shell)
 
 ;;; Constants
@@ -183,16 +237,144 @@ buffers and killed buffers then require no shared lifecycle bookkeeping."
   "Call ORIGINAL `scroll-down' with COUNT, recovering from chat header stalls."
   (agent-shell-chat--scroll-advice original count -1))
 
+(defvar-local agent-shell-chat--live-marker-overlay nil
+  "Overlay last found drawing the live prompt's marker, or nil.
+A hint only: see `agent-shell-chat--find-live-marker-overlay'.")
+
 ;;; Labels
 
-(defun agent-shell-chat--label (text face)
-  "Return TEXT padded and propertized with FACE, as a chat label.
+(defun agent-shell-chat--label (text role)
+  "Return the chat label for TEXT, as `agent-shell-chat-label-function' draws it.
 
-FACE carries the box (see `agent-shell-chat-me-label').
+ROLE is `user' or `agent'.
 
-For example, (agent-shell-chat--label \"Me\" \\='agent-shell-chat-me-label)
-returns \" Me \" in that face."
-  (propertize (format " %s " text) 'face face))
+For example, (agent-shell-chat--label \"Me\" \\='user) returns \" Me \" in
+`agent-shell-chat-me-label' by default."
+  (funcall agent-shell-chat-label-function
+           (list (cons :text text)
+                 (cons :role role))))
+
+(defun agent-shell-chat--boxed-label (label)
+  "Return LABEL's text padded and propertized as a boxed badge.
+
+The default `agent-shell-chat-label-function'.  The face is picked by
+LABEL's :role (see `agent-shell-chat-me-label' and
+`agent-shell-chat-agent-label'), and carries the box.
+
+For example, over \\='((:text . \"Me\") (:role . user)) returns \" Me \"
+in `agent-shell-chat-me-label'."
+  (propertize (format " %s " (map-elt label :text))
+              'face (if (eq (map-elt label :role) 'user)
+                        'agent-shell-chat-me-label
+                      'agent-shell-chat-agent-label)))
+
+(defun agent-shell-chat--row-props (row)
+  "Return overlay properties drawing label ROW on the position it covers.
+
+A row is normally the overlay's `display'.  Emacs ignores `display'
+properties nested inside a `display' string, though, so a row holding
+one (e.g. a label drawn as an image by `agent-shell-chat-label-function')
+is drawn as a `before-string' instead, with `display' left to its line
+terminator.
+
+For example, over \" Me \\n\" in plain text returns
+\((display . \" Me \\n\") (before-string . \"\"))."
+  (if (text-property-not-all 0 (length row) 'display nil row)
+      (let ((terminated (string-suffix-p "\n" row)))
+        (list (cons 'display (if terminated "\n" ""))
+              (cons 'before-string (if terminated
+                                       (substring row 0 -1)
+                                     row))))
+    (list (cons 'display row)
+          (cons 'before-string ""))))
+
+(defun agent-shell-chat--busy-frame ()
+  "Return the busy frame for the heartbeat's current beat, or nil when idle.
+
+For example, on the heartbeat's third beat returns \"-\".  With
+`agent-shell-prompt-busy-frames' set to a string, or to a function
+returning one, returns that string on every beat.  Empty frames, like
+[] or \"\", return nil."
+  (when-let* (((bound-and-true-p agent-shell-show-busy-indicator))
+              (heartbeat (map-elt agent-shell--state :heartbeat))
+              ((eq (map-elt heartbeat :status) 'busy))
+              (frames (if (functionp agent-shell-prompt-busy-frames)
+                          (funcall agent-shell-prompt-busy-frames)
+                        agent-shell-prompt-busy-frames))
+              ((not (seq-empty-p frames))))
+    (if (stringp frames)
+        frames
+      (seq-elt frames (mod (map-elt heartbeat :value) (seq-length frames))))))
+
+(defun agent-shell-chat--live-marker ()
+  "Return the live prompt's marker, animated while the agent works.
+
+For example, returns \"  ❯ \" when idle and \"| ❯ \" while busy, the
+frame faced `agent-shell-secondary' so it recedes behind the marker.
+
+A frame's glyph can come from a fallback font wider than a column, so
+the space after it aligns the marker to the body indent rather than
+trusting the frame's width.  Aligned in units of the buffer's own font,
+which unlike bare columns follow `text-scale-adjust'.  A frame wider
+than a column (like \"(busy)\") can't fit the indent, so a plain space
+follows it instead."
+  (if-let* ((frame (agent-shell-chat--busy-frame)))
+      (concat (propertize frame 'face 'agent-shell-secondary)
+              (propertize (concat (if (> (string-width frame) 1)
+                                      " "
+                                    (propertize " " 'display
+                                                `(space :align-to
+                                                        (,(string-width agent-shell-chat--body-indent)
+                                                         . width))))
+                                  agent-shell-chat--prompt)
+                          'face 'default))
+    (let ((marker (concat agent-shell-chat--body-indent agent-shell-chat--prompt)))
+      ;; A fallback font may draw the chevron narrower than one column.
+      ;; Compose it over a normal space so it advances by a body-font column.
+      ;; Unlike a nested `display', composition works inside overlay strings.
+      (compose-string marker (length agent-shell-chat--body-indent)
+                      (1+ (length agent-shell-chat--body-indent))
+                      '(?\s (mc . mc) ?❯))
+      (propertize marker 'face 'default))))
+
+(defun agent-shell-chat--find-live-marker-overlay ()
+  "Return the overlay drawing the live prompt's marker, or nil.
+
+That overlay carries `agent-shell-chat--marker-head', which relabeling
+clears the moment its prompt is submitted.  The overlay found last is
+cached and trusted for as long as it still carries it: an overlay moves
+with the text around it, so text inserted or deleted above leaves it
+spanning the prompt.  One deleted, or whose prompt was submitted, sends
+this back to scanning the buffer.
+
+Runs on every heartbeat tick, where scanning would list every overlay in
+the buffer each time."
+  (if (and agent-shell-chat--live-marker-overlay
+           (overlay-buffer agent-shell-chat--live-marker-overlay)
+           (overlay-get agent-shell-chat--live-marker-overlay
+                        'agent-shell-chat--marker-head))
+      agent-shell-chat--live-marker-overlay
+    (setq agent-shell-chat--live-marker-overlay
+          (save-restriction
+            (widen)
+            (seq-find (lambda (overlay)
+                        (overlay-get overlay 'agent-shell-chat--marker-head))
+                      (overlays-in (point-min) (point-max)))))))
+
+(defun agent-shell-chat--animate-live-marker ()
+  "Redraw the live prompt's marker for the heartbeat's current beat.
+
+Runs on every heartbeat tick, so it rewrites the one overlay drawing the
+marker rather than relabeling the buffer.  That overlay carries the text
+drawn ahead of the marker as `agent-shell-chat--marker-head': empty
+where the marker is drawn alone as `display', and the `Me' label where
+both are drawn as `before-string'."
+  (when-let* ((overlay (agent-shell-chat--find-live-marker-overlay))
+              (head (overlay-get overlay 'agent-shell-chat--marker-head))
+              (property (if (string-empty-p head) 'display 'before-string))
+              (drawn (concat head (agent-shell-chat--live-marker))))
+    (unless (equal (overlay-get overlay property) drawn)
+      (overlay-put overlay property drawn))))
 
 (defun agent-shell-chat--agent-name ()
   "Return the attached agent's display name for the response label.
@@ -271,23 +453,42 @@ changed), otherwise creates one.  Reusing, and writing only what
 changed, leaves an unchanged buffer untouched: relabeling runs on every
 agent event, and each overlay write dirties its span for redisplay.
 
+Writing only what it is handed also means a reused overlay keeps every
+property PROPS leaves out, whoever wrote it.  A caller drawing a label
+therefore spells out both of the properties a label can be drawn with
+\(`display' and `before-string'), including the one it does not use, so
+that relabeling heals an overlay a differently drawn label left behind
+\(see `agent-shell-chat--label-rows').
+
 ANCHOR-BEG..ANCHOR-END default to the span, and are widened only where
 an overlay is expected to sit somewhere its span no longer covers.
 
-With REAR-ADVANCE non-nil the overlay takes in text inserted at its end
-and is not `evaporate'd while empty, so it can hold properties over an
-input still being typed: relabeling is event-driven, so an overlay that
-stopped at the caret would never grow to cover what follows it."
+With REAR-ADVANCE non-nil the overlay takes in text inserted at its end,
+so it can hold properties over an input still being typed: relabeling is
+event-driven, so an overlay that stopped at the caret would never grow
+to cover what follows it."
   (let ((overlay (or (seq-find (lambda (overlay)
                                  (eq (overlay-get overlay 'agent-shell-chat--tag) tag))
                                (overlays-in anchor-beg (max anchor-end (1+ anchor-beg))))
                      (let ((created (make-overlay beg end nil nil rear-advance)))
                        (overlay-put created 'agent-shell-chat--tag tag)
-                       (unless rear-advance
-                         (overlay-put created 'evaporate t))
-                       created))))
+                       created)))
+        ;; `evaporate' is carried only while the span has text to
+        ;; evaporate with.  BEG..END can be empty (a restored turn leaves
+        ;; the marker with no room between it and the response it labels),
+        ;; and an empty overlay is deleted the moment `evaporate' lands on
+        ;; it, taking the label with it and leaving this holding an
+        ;; overlay with no buffer at all.  Dropped before a move that
+        ;; empties the span, taken back up after one that fills it, for
+        ;; the same reason.  A rear-advancing overlay never carries it: it
+        ;; starts out empty, waiting on input still being typed.
+        (evaporates (and (not rear-advance) (< beg end))))
+    (when (and (not evaporates) (overlay-get overlay 'evaporate))
+      (overlay-put overlay 'evaporate nil))
     (unless (and (= (overlay-start overlay) beg) (= (overlay-end overlay) end))
       (move-overlay overlay beg end))
+    (when (and evaporates (not (overlay-get overlay 'evaporate)))
+      (overlay-put overlay 'evaporate t))
     (map-do (lambda (property value)
               (unless (equal (overlay-get overlay property) value)
                 (overlay-put overlay property value)))
@@ -359,22 +560,47 @@ anything else are left out."
                        (= (overlay-start candidate) position)))
                 (overlays-in position (1+ position)))))
 
+(defun agent-shell-chat--draws-name-p (overlay property)
+  "Return non-nil when OVERLAY's PROPERTY draws a label's name.
+
+A label is layout as much as name: blank lines above and below it, and
+the rows carrying those are blank strings.  So is the string an overlay
+drawing no label carries, which is empty rather than absent.  Only the
+one row with a name in it counts, or a whole label would be read as one
+per row.
+
+For example, over a row displaying \" Claude \\n\" returns non-nil, and
+over the blank row padding it out returns nil."
+  (let ((value (overlay-get overlay property)))
+    (and (stringp value)
+         (not (string-blank-p value)))))
+
 (defun agent-shell-chat--turn-label-at (position)
   "Return the turn label chat mode draws at POSITION, or nil for none.
 
-Read from the overlay's `agent-shell-chat--tag' rather than its
-`before-string', which wraps the name in layout (blank lines, the prompt
-glyph).  An overlay drawing no label carries an empty `before-string'
-rather than none, so emptiness is what rules it out: counting it would
-label a turn twice.
+Read from the overlay's `agent-shell-chat--tag' rather than from what it
+draws, which wraps the name in layout (blank lines, the prompt glyph).
+
+A label is drawn a row to each buffer position, as a `display', or
+carried whole on a `before-string' where there are too few positions to
+go around.  Either way exactly one string has the name in it (see
+`agent-shell-chat--draws-name-p'), so a turn is labeled once.
+
+The `me' overlay is read for its `before-string' alone: its `display'
+carries the live prompt's marker, which is a glyph to type at rather
+than a label.
 
 For example, at a submitted turn returns \"Me\"."
   (when-let* ((labelled (seq-find
                          (lambda (candidate)
-                           (and (memq (overlay-get candidate 'agent-shell-chat--tag)
-                                      '(me me-label agent))
-                                (not (string-empty-p
-                                      (or (overlay-get candidate 'before-string) "")))))
+                           (when-let* ((tag (overlay-get candidate
+                                                         'agent-shell-chat--tag))
+                                       ((memq tag '(me me-label agent))))
+                             (or (agent-shell-chat--draws-name-p
+                                  candidate 'before-string)
+                                 (and (not (eq tag 'me))
+                                      (agent-shell-chat--draws-name-p
+                                       candidate 'display)))))
                          (agent-shell-chat--tagged-overlays-at position))))
     (if (eq (overlay-get labelled 'agent-shell-chat--tag) 'agent)
         (agent-shell-chat--agent-name)
@@ -401,6 +627,16 @@ putting the resume point at the \"q\" of \"question\"."
     (list (cons :start (overlay-start hiding))
           (cons :end (overlay-end hiding)))))
 
+(defun agent-shell-chat--draft-indent ()
+  "Return the indent lining a draft's later lines up with its first.
+The first line shares the prompt's row, starting past the marker drawn
+there, so the lines below it clear the marker's width as well as the
+body indent to start at the same column.  A submitted turn drops back to
+`agent-shell-chat--body-indent', where the marker is gone and the
+response body sits."
+  (concat agent-shell-chat--body-indent
+          (make-string (string-width agent-shell-chat--prompt) ?\s)))
+
 (defun agent-shell-chat--draft-tail-indent (beg end)
   "Return the indent a draft spanning BEG..END needs on its last line.
 
@@ -411,10 +647,10 @@ to carry the prefix.  A string standing at that position indents the row
 instead, and gives way (to \"\") the moment there is a character for the
 prefix itself.
 
-For example, over a draft of \"one\\n\" returns the body indent, and over
+For example, over a draft of \"one\\n\" returns the draft indent, and over
 \"one\" returns \"\"."
   (if (and (> end beg) (eq (char-before end) ?\n))
-      agent-shell-chat--body-indent
+      (agent-shell-chat--draft-indent)
     ""))
 
 (defun agent-shell-chat--draft-changed (draft after &rest _)
@@ -425,27 +661,42 @@ change is in.  Kept off the relabel path: relabeling is event-driven and
 coalesced, so none runs between the newline that empties the last line
 and the character that fills it.
 
-Stops DRAFT at the end-of-prompt marker once the turn is submitted.  The
-marker and the response that follows it both arrive at end of buffer,
-which a rear-advancing overlay takes in, indenting the response as though
-it were still being typed until the next relabel drops the overlay.
+Widens before reading DRAFT's bounds: the hooks fire during whatever
+edit provoked them, and a caller rendering above the prompt narrows to
+end before it (see `agent-shell--update-fragment'), while DRAFT
+rear-advances toward end of buffer.  Its bounds then lie outside that
+restriction, which `text-property-any' rejects outright."
+  (when after
+    (save-restriction
+      (widen)
+      (agent-shell-chat--draft-reindent draft))))
+
+(defun agent-shell-chat--draft-reindent (draft)
+  "Set DRAFT's trailing indent, stopping it at a submitted turn's marker.
+
+The marker and the response that follows it both arrive at end of
+buffer, which a rear-advancing overlay takes in, indenting the response
+as though it were still being typed until the next relabel drops the
+overlay.
+
+Split out of `agent-shell-chat--draft-changed' so the widening it needs
+wraps every buffer position this reads.
 
 For example, over a DRAFT covering \"one\\n\" sets its `after-string' to
 the body indent, and over \"one\" sets it to \"\".  Once a submission has
 made that \"one\\n<marker>\", DRAFT is left ending before the marker, with
 an `after-string' of \"\"."
-  (when after
-    (let* ((submitted (text-property-any (overlay-start draft)
-                                         (overlay-end draft)
-                                         'shell-maker--marker t))
-           (indent (if submitted
-                       ""
-                     (agent-shell-chat--draft-tail-indent
-                      (overlay-start draft) (overlay-end draft)))))
-      (when submitted
-        (move-overlay draft (overlay-start draft) submitted))
-      (unless (equal (overlay-get draft 'after-string) indent)
-        (overlay-put draft 'after-string indent)))))
+  (let* ((submitted (text-property-any (overlay-start draft)
+                                       (overlay-end draft)
+                                       'shell-maker--marker t))
+         (indent (if submitted
+                     ""
+                   (agent-shell-chat--draft-tail-indent
+                    (overlay-start draft) (overlay-end draft)))))
+    (when submitted
+      (move-overlay draft (overlay-start draft) submitted))
+    (unless (equal (overlay-get draft 'after-string) indent)
+      (overlay-put draft 'after-string indent))))
 
 (defun agent-shell-chat--search-marker-forward ()
   "Search forward for shell-maker's end-of-prompt marker.
@@ -465,6 +716,30 @@ past it, and over the same text unpropertized returns nil."
                 (re-search-forward "<shell-maker-end-of-prompt>" nil t))
       (setq found (get-text-property (match-beginning 0) 'shell-maker--marker)))
     found))
+
+(defun agent-shell-chat--label-rows (label)
+  "Split LABEL into display rows, one string per row.
+
+Each row is meant for a buffer position of its own.  A multi-row string
+stacks every row on the single position it hangs from, and `window-start'
+can only ever be a buffer position, so scrolling by fewer rows than the
+string spans has nowhere to land and stops advancing (on graphical
+frames; terminals advance through it fine).
+
+Rows are drawn with `display' where the label used to be drawn with a
+single `before-string'.  Both properties are written wherever either is,
+so that a shell labeled by the other version heals on its next relabel
+rather than showing its label twice: overlays are reused by tag, and a
+reused one keeps whatever the version before wrote (see
+`agent-shell-chat--ensure-overlay').
+
+For example, over \"\\n Me \\n\" returns (\"\\n\" \" Me \\n\"), and over a
+label with no newline returns it unchanged as a single row."
+  (let ((pieces (split-string label "\n")))
+    (append (mapcar (lambda (piece) (concat piece "\n")) (butlast pieces))
+            (let ((tail (car (last pieces))))
+              (unless (string-empty-p tail)
+                (list tail))))))
 
 (defun agent-shell-chat--gc-overlays (tags kept)
   "Delete label overlays of TAGS not in KEPT (a list of overlays).
@@ -605,8 +880,7 @@ cursor on the label row.  Updates in place."
                       (save-excursion (goto-char run-end)
                                       (skip-chars-forward " \t\n")
                                       (point))))
-               (me-label (agent-shell-chat--label
-                          "Me" 'agent-shell-chat-me-label))
+               (me-label (agent-shell-chat--label "Me" 'user))
                ;; Face the padding and marker `default' so they do not inherit
                ;; the covered text's face: a display string's unfaced chars
                ;; take the face of the text they replace, and after a code
@@ -667,14 +941,14 @@ cursor on the label row.  Updates in place."
                ;; drop it the instant the user starts typing.  Carried as the
                ;; covered prompt's `display', standing on its buffer positions.
                (marker (when (and live labeled)
-                         (propertize (concat agent-shell-chat--body-indent
-                                             agent-shell-chat--prompt)
-                                     'face 'default)))
+                         (agent-shell-chat--live-marker)))
                ;; Indents the prompt's own line, which the input's first line
-               ;; shares.  An unlabeled run has no input to line up.
-               (input-indent (if (and labeled (not blank))
-                                 agent-shell-chat--body-indent
-                               ""))
+               ;; shares.  Where a marker heads that line, the first line starts
+               ;; past it, so its wrapped rows clear the marker too.  An
+               ;; unlabeled run has no input to line up.
+               (input-indent (cond ((or (not labeled) blank) "")
+                                   (marker (agent-shell-chat--draft-indent))
+                                   (t agent-shell-chat--body-indent)))
                ;; The label, closed by the newline it rides rather than by the
                ;; second half of `pad'.  A leading prompt has no newline to
                ;; ride, so its label stands before the covered prompt and
@@ -692,7 +966,24 @@ cursor on the label row.  Updates in place."
                ;; instead, where the live prompt shows its marker.
                (leading-indent (when (and leading labeled (not marker))
                                  (propertize agent-shell-chat--body-indent
-                                             'face 'default))))
+                                             'face 'default)))
+               ;; One row per covered prompt position, where the prompt is
+               ;; long enough to hold them; the overlay covering the prompt
+               ;; then starts past the rows rather than under them.
+               ;;
+               ;; Laid past the newline above rather than before it, which
+               ;; shifts the padding by one row in each direction: that
+               ;; newline now closes the row `lead' opened with its first, and
+               ;; the label needs a blank line of its own after it (the second
+               ;; half of `pad') where it used to borrow that newline's.  What
+               ;; `lead' accounts for beyond that first newline still holds.
+               (label-rows (and label-nl
+                                (agent-shell-chat--label-rows
+                                 (concat (string-remove-prefix "\n" lead)
+                                         me-label pad))))
+               ;; Whether the covered prompt has a position for every row.
+               (split (<= (length label-rows) (- run-end pos)))
+               (label-start (if split (+ pos (length label-rows)) pos)))
           ;; Collapse whatever blank lines precede the one the label rides.
           (when (and label-nl (> label-nl start))
             (push
@@ -702,19 +993,48 @@ cursor on the label row.  Updates in place."
                            (cons 'line-prefix "")
                            (cons 'wrap-prefix "")))
              kept))
-          ;; Carry the label on the newline above, left visible so it keeps
-          ;; closing its line.
+          ;; Lay the label's rows over the head of the covered prompt, one row
+          ;; per buffer position, so every row is somewhere `window-start' can
+          ;; land (see `agent-shell-chat--label-rows').  The prompt is hidden
+          ;; either way, so the rows cost nothing that was being shown.  Falls
+          ;; back to carrying the whole label on the newline above when the
+          ;; prompt is too short to hold a row apiece.
           (when label-nl
-            (push
-             (agent-shell-chat--ensure-overlay
-              :tag 'me-label :beg label-nl :end pos
-              :props (list (cons 'before-string before)
-                           (cons 'line-prefix "")
-                           (cons 'wrap-prefix "")))
-             kept))
+            (if split
+                (seq-do-indexed
+                 (lambda (row offset)
+                   (push
+                    (agent-shell-chat--ensure-overlay
+                     :tag 'me-label
+                     :beg (+ pos offset) :end (+ pos offset 1)
+                     ;; Both `display' and `before-string' are spelled out
+                     ;; so that a reused overlay cannot keep a label drawn
+                     ;; the other way (see `agent-shell-chat--ensure-overlay').
+                     :props (append
+                             (agent-shell-chat--row-props row)
+                             ;; Above the overlay covering the prompt, whose
+                             ;; `line-prefix' would otherwise indent the label
+                             ;; with the input it belongs beside.
+                             (list (cons 'priority 100)
+                                   (cons 'line-prefix "")
+                                   (cons 'wrap-prefix ""))))
+                    kept))
+                 label-rows)
+              (push
+               (agent-shell-chat--ensure-overlay
+                :tag 'me-label :beg label-nl :end pos
+                :props (list (cons 'before-string before)
+                             ;; Spelled out for the same reason, as `nil'
+                             ;; rather than "": this overlay covers the
+                             ;; newline above, which an empty `display'
+                             ;; would hide along with it.
+                             (cons 'display nil)
+                             (cons 'line-prefix "")
+                             (cons 'wrap-prefix "")))
+               kept)))
           (push
            (agent-shell-chat--ensure-overlay
-            :tag 'me :beg (if label-nl pos start) :end end
+            :tag 'me :beg (if label-nl label-start start) :end end
             ;; Anchor on the prompt run, which the span may start before: the
             ;; span's start flips with `label-nl', and reuse has to survive
             ;; that flip rather than strand the overlay it should have moved.
@@ -761,7 +1081,14 @@ cursor on the label row.  Updates in place."
                                (and leading-indent t))
                          (cons 'line-prefix
                                (if (and label-nl (not marker)) input-indent ""))
-                         (cons 'wrap-prefix (if label-nl input-indent ""))))
+                         (cons 'wrap-prefix (if label-nl input-indent ""))
+                         ;; What is drawn ahead of the marker, so a heartbeat
+                         ;; tick can redraw it alone (see
+                         ;; `agent-shell-chat--animate-live-marker').  Cleared
+                         ;; the moment the prompt is submitted.
+                         (cons 'agent-shell-chat--marker-head
+                               (when marker
+                                 (if (or label-nl leading) "" before)))))
            kept)
           ;; Indent the live prompt's draft below its first line, which the
           ;; marker indents.  The overlay above covers the prompt text alone,
@@ -774,8 +1101,8 @@ cursor on the label row.  Updates in place."
              (agent-shell-chat--ensure-overlay
               :tag 'me-draft :beg run-end :end (point-max)
               :rear-advance t
-              :props (list (cons 'line-prefix agent-shell-chat--body-indent)
-                           (cons 'wrap-prefix agent-shell-chat--body-indent)
+              :props (list (cons 'line-prefix (agent-shell-chat--draft-indent))
+                           (cons 'wrap-prefix (agent-shell-chat--draft-indent))
                            ;; Indents a last line left empty by a newline,
                            ;; which the prefix cannot reach.  The hooks keep
                            ;; it in step with what is typed.
@@ -838,8 +1165,7 @@ newline would merge the input line into the response for line motion
   (save-excursion
     (goto-char (point-min))
     (let ((label (agent-shell-chat--label
-                  (agent-shell-chat--agent-name)
-                  'agent-shell-chat-agent-label))
+                  (agent-shell-chat--agent-name) 'agent))
           (kept nil))
       (while (agent-shell-chat--search-marker-forward)
         (let* ((mbeg (match-beginning 0))
@@ -899,12 +1225,58 @@ newline would merge the input line into the response for line motion
           ;; it (keeping the terminator visible), and the span alone would
           ;; miss the overlay it should have reused.
           (unless response-empty
-            (push
-             (agent-shell-chat--ensure-overlay
-              :tag 'agent :beg start :end end
-              :anchor-beg mbeg :anchor-end end
-              :props (list (cons 'before-string before) (cons 'display "")))
-             kept))))
+            (let* ((rows (agent-shell-chat--label-rows before))
+                   ;; As for the prompt label: a row to each buffer position,
+                   ;; so every one is somewhere `window-start' can land.  The
+                   ;; span opens on the marker, which is hidden either way and
+                   ;; long enough to carry them.
+                   (split (<= (length rows) (- end start)))
+                   (body-start (if split (+ start (length rows)) start)))
+              (when split
+                (seq-do-indexed
+                 (lambda (row offset)
+                   (push
+                    (agent-shell-chat--ensure-overlay
+                     ;; Tagged as the response is, rather than with a tag of
+                     ;; the rows' own: a version drawing the label whole
+                     ;; sweeps by tag, and a tag it has never heard of
+                     ;; survives that sweep, its relabel and even turning the
+                     ;; mode off, drawing the label a second time for good.
+                     ;; Sharing costs nothing: a row's span never overlaps
+                     ;; the response's, and both spell out every property
+                     ;; either draws with.
+                     :tag 'agent
+                     :beg (+ start offset) :end (+ start offset 1)
+                     ;; `before-string' is spelled out to clear the label
+                     ;; the version before carried whole on this overlay.
+                     :props (append (agent-shell-chat--row-props row)
+                                    (list (cons 'priority 100))))
+                    kept))
+                 rows))
+              (push
+               (agent-shell-chat--ensure-overlay
+                :tag 'agent :beg body-start :end end
+                :anchor-beg (if split body-start mbeg) :anchor-end end
+                :props (list (cons 'before-string (if split "" before))
+                             (cons 'display "")
+                             ;; The response's first line starts a row inside
+                             ;; this overlay, where the label's last row ended,
+                             ;; so the row takes its prefix from here rather
+                             ;; than from the body text it runs into: without
+                             ;; one that line renders flush left while the rest
+                             ;; of the response is indented.  Carried only
+                             ;; where the label is split out into rows; with
+                             ;; the label rendering here, its own rows would
+                             ;; take the indent along with it.
+                             (cons 'line-prefix
+                                   (and split (get-text-property end 'line-prefix)))
+                             (cons 'wrap-prefix
+                                   (and split (get-text-property end 'wrap-prefix)))
+                             ;; Sharing the rows' tag, this can be reused
+                             ;; from one: clear the priority a row carries,
+                             ;; which the response has no call for.
+                             (cons 'priority nil)))
+               kept)))))
       (agent-shell-chat--gc-overlays '(agent) kept)
       ;; TODO: Remove after 2026-09-28 (see `agent-shell-chat--label-prompts').
       (dolist (overlay (overlays-in (point-min) (point-max)))
@@ -956,8 +1328,9 @@ flips between hidden and `Me' immediately across all shells."
 Deferred so the triggering change's own text properties (e.g. the prompt
 face shell-maker applies after inserting) are in place; coalesced so a
 burst yields a single relabel.  Runs from the event subscription (which
-covers submissions, streaming, turn completion and `session-restored')
-and from `shell-maker-finish-output-hook' (which covers `clear')."
+covers submissions, streaming, turn completion and `session-restored'),
+`shell-maker-finish-output-hook' (`clear') and
+`agent-shell-section-functions' (fragments rendered with no event)."
   (when (and agent-shell-chat--labeled
              (not agent-shell-chat--relabel-timer))
     (setq agent-shell-chat--relabel-timer
@@ -993,14 +1366,14 @@ replaced by the label, a blank line, and the marker the input follows:
 
    Me
 
-    \N{U+276F} "
+    \N{U+276F}"
   (let ((overlay (make-overlay beg end)))
     (overlay-put overlay 'agent-shell-chat--tag 'me)
     (overlay-put overlay 'display "")
     ;; Laid out as the shell lays out its own live prompt, without its
     ;; leading pad: nothing sits above this one to separate it from.
     (overlay-put overlay 'before-string
-                 (concat (agent-shell-chat--label "Me" 'agent-shell-chat-me-label)
+                 (concat (agent-shell-chat--label "Me" 'user)
                          (propertize "\n\n" 'face 'default)
                          (propertize (concat agent-shell-chat--body-indent
                                              agent-shell-chat--prompt)
@@ -1028,9 +1401,13 @@ relabel tracks submissions, streaming responses, turn completion and
 reloads (`session-restored'), and adds a buffer-local
 `shell-maker-finish-output-hook' so `clear' and the other internal
 commands (which reprint the prompt with no `agent-shell' event) relabel
-too."
+too.  A buffer-local `agent-shell-section-functions' relabels after
+fragments rendered with no event, which the live prompt's label would
+otherwise hide."
   (unless agent-shell-chat--labeled
     (setq-local agent-shell-chat--labeled t)
+    ;; Chat mode draws its own busy frame (see `agent-shell-chat--live-marker').
+    (agent-shell--clear-busy-prompt)
     (agent-shell-chat--relabel)
     (setq-local agent-shell-chat--subscription
                 (agent-shell-subscribe-to
@@ -1038,12 +1415,16 @@ too."
                  :on-event #'agent-shell-chat--schedule-relabel))
     (add-hook 'shell-maker-finish-output-hook
               #'agent-shell-chat--schedule-relabel nil t)
+    (add-hook 'agent-shell-section-functions
+              #'agent-shell-chat--schedule-relabel nil t)
     (add-hook 'agent-shell-prompt-queue-setup-minibuffer-functions
               #'agent-shell-chat--decorate-queued-prompt)))
 
 (defun agent-shell-chat--disable ()
-  "Remove chat labels, subscription, timer and hook from the current buffer."
+  "Remove chat labels, subscription, timer and hooks from the current buffer."
   (remove-hook 'shell-maker-finish-output-hook
+               #'agent-shell-chat--schedule-relabel t)
+  (remove-hook 'agent-shell-section-functions
                #'agent-shell-chat--schedule-relabel t)
   (when agent-shell-chat--subscription
     (agent-shell-unsubscribe :subscription agent-shell-chat--subscription))
@@ -1067,6 +1448,7 @@ too."
   (kill-local-variable 'agent-shell-chat--subscription)
   (kill-local-variable 'agent-shell-chat--relabel-timer)
   (kill-local-variable 'agent-shell-chat--last-prompt-end)
+  (kill-local-variable 'agent-shell-chat--live-marker-overlay)
   (kill-local-variable 'agent-shell-chat--labeled))
 
 ;;; Mode
@@ -1093,12 +1475,16 @@ Enable it for new shells by default with `agent-shell-chat-mode-enabled'."
     (setq agent-shell-chat-mode nil)
     (user-error "Not in an `agent-shell' buffer"))))
 
-;; Shells labeled by a version that named overlays with `category' keep
-;; overlays relabeling no longer recognises, which render their label a
-;; second time.  A package upgrade reloads this file into the running
-;; session (see `package--reload-previously-loaded'), so relabel there and
-;; then rather than leaving those shells wrong until their next turn.
-;; TODO: Remove after 2026-09-28.
+;; Shells labeled by an earlier version carry labels this one draws
+;; differently: named by `category' rather than by a tag, or carried whole
+;; on the newline above rather than a row to each buffer position.  Left
+;; alone they render their label a second time.  A package upgrade reloads
+;; this file into the running session (see
+;; `package--reload-previously-loaded'), so relabel there and then rather
+;; than leaving those shells wrong until their next turn.  Every relabel
+;; heals them too (see `agent-shell-chat--ensure-overlay'), so this is the
+;; first of two lines of defence rather than the only one.
+;; TODO: Remove after 2026-10-09.
 (dolist (buffer (buffer-list))
   (when (buffer-local-value 'agent-shell-chat--labeled buffer)
     (with-current-buffer buffer

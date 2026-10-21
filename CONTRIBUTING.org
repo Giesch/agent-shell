@@ -255,16 +255,33 @@ runner.  Replace =SOCKET= with that server's name and =ROOT= with the
 absolute checkout directory:
 
 #+begin_src bash
-  emacsclient -s SOCKET --eval '(load "ROOT/tests/run-batch.el" nil t)'
-  emacsclient -s SOCKET --eval '(agent-shell-tests-run-batch "ROOT")'
+  emacsclient -s SOCKET --alternate-editor=false --eval '(let ((enable-local-variables nil) (enable-dir-local-variables nil)) (load "ROOT/tests/run-batch.el" nil t t))'
+  emacsclient -s SOCKET --alternate-editor=false --eval '(agent-shell-tests-run-batch "ROOT" nil (list "TEST-ROOT/acp.el" "TEST-ROOT/shell-maker" "TEST-ROOT/compat"))'
 #+end_src
 
-The runner explicitly loads candidate sources, checks their provenance, and
-reports =TOTAL=, =COMPLETED=, =UNEXPECTED=, and =SKIPPED= counts.  Dependencies
-are discovered in sibling checkouts or on =load-path=; a clean server may
-need the dependency library directories added to =load-path= first.  Require
-=COMPLETED= to equal =TOTAL= and investigate unexpected results and skips.
-Some graphical tests skip when no graphical frame is available.
+Replace =TEST-ROOT= with a private directory outside the checkout.  Provision
+shell-maker >= 0.97.5, compat, and the Giesch acp.el fork there.  The acp.el
+fork must include both upstream >= 0.17.1 and the disconnect subscription and
+elicitation response APIs; upstream's version number alone does not establish
+those fork contracts.  A verified dependency revision is
+=00ad3f716cb3b5ea996e6799ef426d29dad50be6=.  Do not update daily installations
+or sibling checkouts for a test run.
+
+The runner loads exact candidate sources, checks exact-file provenance,
+rejects duplicate ERT definitions before loading, and checks coverage against
+both merge parents.  Dependencies resolve from the supplied directories or
+=load-path=, not sibling checkouts.  It reports =TOTAL=, =COMPLETED=,
+=UNEXPECTED=, and =SKIPPED=.  Require =TOTAL > 0=, =COMPLETED = TOTAL=, and
+=UNEXPECTED = 0=.  Required integration tests must be selected, completed, and
+not skipped.
+
+Run rendering acceptance in an owned graphical frame, not the daemon's
+initial terminal frame.  One offscreen option is Xvfb extracted under the
+private test root.  Start the disposable daemon with =WAYLAND_DISPLAY= unset,
+=DISPLAY= set to the private Xvfb display, and =GDK_BACKEND=x11=.  Verify
+=display-graphic-p=, observed window geometry, and screenshot capture.  Run
+required graphical tests with zero skips.  Stop the owned daemon before
+stopping its display; never use the daily editor as a fallback.
 
 Native submit transport, first-message clear/history, and elicitation form
 regressions belong in =tests/agent-shell-transport-tests.el= and

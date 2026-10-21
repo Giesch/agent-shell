@@ -377,9 +377,12 @@ point."
                                        (cons :new "world\n")
                                        (cons :file "test.el")))))
          (shell-buf (generate-new-buffer " *test-shell*"))
+         (client (list (cons :name "permission-test")))
          (tool-data (list (cons :status "pending")
+                          (cons :permission-request-id "req-1")
                           (cons :diff-buffer diff-buf)))
          (state (list (cons :buffer shell-buf)
+                      (cons :client client)
                       (cons :tool-calls
                             (list (cons "tc-1" tool-data))))))
     (unwind-protect
@@ -394,7 +397,7 @@ point."
                     ((symbol-function 'agent-shell-viewport--buffer) (lambda (&rest _) nil)))
             (with-current-buffer shell-buf
               (agent-shell--send-permission-response
-               :client nil
+               :client client
                :request-id "req-1"
                :option-id "opt-1"
                :state state

@@ -11,6 +11,9 @@
 (require 'seq)
 (require 'acp)
 
+(defvar agent-shell-elicitation-capability)
+(declare-function agent-shell-viewport--shell-buffer "agent-shell-viewport")
+
 (defun agent-shell--elicitation-put! (record key value)
   "Set KEY to VALUE in nonempty RECORD, preserving its identity."
   (if-let* ((entry (assq key record)))
@@ -107,7 +110,8 @@ Only `_meta.codex.isSecret' marks a supported sensitive property."
     (agent-shell--elicitation-reject 'malformed-choice))
   (list (cons :value (map-elt acp-option 'const))
         (cons :title (or (map-elt acp-option 'title) (map-elt acp-option 'const)))
-        (cons :description (map-elt acp-option 'description))))
+        (cons :description (map-elt acp-option 'description))
+        (cons :preview (agent-shell-elicitation--option-preview acp-option))))
 
 (defun agent-shell--elicitation-options (acp-options)
   "Normalize the nonempty ACP-OPTIONS vector, rejecting duplicates."
@@ -124,9 +128,15 @@ Only `_meta.codex.isSecret' marks a supported sensitive property."
   (let ((metadata (agent-shell--elicitation-metadata spec)))
     (when (map-elt metadata :companion)
       (unless (and (equal (map-elt spec 'type) "string")
-                   (not (map-contains-key spec 'oneOf)))
+                   (not (map-contains-key spec 'oneOf))
+                   (not (map-contains-key spec 'enum)))
         (agent-shell--elicitation-reject 'malformed-companion))
-      (list (cons :name name) (cons :question (map-elt metadata :question))
+      (when (and (map-contains-key spec 'default)
+                 (not (stringp (map-elt spec 'default))))
+        (agent-shell--elicitation-reject 'invalid-default))
+      (list (cons :name name)
+            (cons :join-multi (map-contains-key (map-elt spec '_meta) '_askUserQuestionCustomAnswer))
+            (cons :question (map-elt metadata :question))
             (cons :title (or (map-elt spec 'title) "Other"))
             (cons :description (map-elt spec 'description))))))
 
@@ -134,21 +144,85 @@ Only `_meta.codex.isSecret' marks a supported sensitive property."
   "Normalize field NAME from SPEC and attach its CUSTOM companion."
   (let* ((type (map-elt spec 'type))
          (multi (equal type "array"))
-         (text (and (equal type "string") (not (map-contains-key spec 'oneOf))))
-         (options (unless text
-                    (agent-shell--elicitation-options
-                     (if multi (map-nested-elt spec '(items anyOf))
-                       (map-elt spec 'oneOf))))))
-    (unless (member type '("string" "array"))
+         (choice-spec (if multi (map-elt spec 'items) spec))
+         (choices (or (map-elt choice-spec (if multi 'anyOf 'oneOf))
+                      (when (map-contains-key choice-spec 'enum)
+                        (let ((values (map-elt choice-spec 'enum)))
+                          (unless (and (vectorp values) (seq-every-p #'stringp values))
+                            (agent-shell--elicitation-reject 'malformed-choices))
+                          (vconcat (mapcar (lambda (value) `((const . ,value))) values))))))
+         (text (and (not multi) (not choices)))
+         (options (unless text (agent-shell--elicitation-options choices)))
+         (kind (cond ((member type '("boolean" "number" "integer")) (intern type))
+                     (text 'text) (multi 'multi-choice) (t 'choice))))
+    (unless (member type '("string" "array" "boolean" "number" "integer"))
       (agent-shell--elicitation-reject 'unsupported-type))
     (when (and text custom)
       (agent-shell--elicitation-reject 'companion-without-choices))
-    (list (cons :name name)
-          (cons :title (map-elt spec 'title))
-          (cons :description (map-elt spec 'description))
-          (cons :multi multi) (cons :options options) (cons :custom custom)
-          (cons :kind (cond (text 'text) (multi 'multi-choice) (t 'choice)))
-          (cons :secret (map-elt (agent-shell--elicitation-metadata spec) :secret)))))
+    (let ((field (list (cons :name name) (cons :title (map-elt spec 'title))
+                       (cons :description (map-elt spec 'description))
+                       (cons :multi multi) (cons :options options) (cons :custom custom)
+                       (cons :kind kind)
+                       (cons :has-default (map-contains-key spec 'default))
+                       (cons :schema (seq-filter (lambda (entry) (memq (car entry) '(minimum maximum))) spec))
+                       (cons :secret (map-elt (agent-shell--elicitation-metadata spec) :secret)))))
+      (dolist (bound '(minimum maximum))
+        (when (and (map-contains-key spec bound) (not (agent-shell--elicitation-finite-number-p (map-elt spec bound))))
+          (agent-shell--elicitation-reject 'malformed-bound)))
+      (when (and (map-contains-key spec 'minimum) (map-contains-key spec 'maximum)
+                 (> (map-elt spec 'minimum) (map-elt spec 'maximum)))
+        (agent-shell--elicitation-reject 'contradictory-bounds))
+      (when (and (map-contains-key spec 'default)
+                 (not (agent-shell--elicitation-value-valid-p field (map-elt spec 'default))))
+        (agent-shell--elicitation-reject 'invalid-default))
+      field)))
+
+(defun agent-shell--elicitation-read-value (field prompt old operation)
+  "Read a typed FIELD value with PROMPT and OLD for OPERATION.
+
+Invalid numeric input stays in the editor loop and is never coerced."
+  (if (or (eq operation 'other) (not (memq (map-elt field :kind) '(boolean number integer))))
+      (if (map-elt field :secret) (read-passwd prompt) (read-string prompt old))
+    (if (eq (map-elt field :kind) 'boolean)
+        (if (y-or-n-p prompt) t :false)
+      (catch 'value
+        (let ((initial (when old (format "%s" old))))
+          (while t
+            (let* ((text (if (map-elt field :secret) (read-passwd prompt)
+                           (read-string prompt initial)))
+                   (value (and (string-match-p
+                                (if (eq (map-elt field :kind) 'integer)
+                                    "\\`[+-]?[0-9]+\\'"
+                                  "\\`[+-]?\\(?:[0-9]+\\(?:\\.[0-9]*\\)?\\|\\.[0-9]+\\)\\(?:[eE][+-]?[0-9]+\\)?\\'") text)
+                               (string-to-number text))))
+              (when (equal text "") (throw 'value ""))
+              (when (and value (agent-shell--elicitation-value-valid-p field value))
+                (throw 'value value))
+              (setq initial text)
+              (message "Enter a valid number within the field's limits"))))))))
+
+(defun agent-shell--elicitation-finite-number-p (value)
+  "Return non-nil for finite numeric VALUE, including arbitrary integers."
+  (and (numberp value)
+       (or (integerp value)
+           (and (= value value) (= (- value value) 0.0)))))
+
+(defun agent-shell--elicitation-value-valid-p (field value)
+  "Check VALUE against the complete normalized FIELD contract."
+  (let* ((spec (map-elt field :schema))
+         (options (mapcar (lambda (option) (map-elt option :value)) (map-elt field :options))))
+    (pcase (or (map-elt field :kind) (if (map-elt field :multi) 'multi-choice 'choice))
+      ('text (stringp value))
+      ('boolean (memq value '(t :false)))
+      ((or 'number 'integer)
+       (and (if (eq (map-elt field :kind) 'integer) (integerp value) (numberp value))
+            (agent-shell--elicitation-finite-number-p value)
+            (or (not (map-contains-key spec 'minimum)) (>= value (map-elt spec 'minimum)))
+            (or (not (map-contains-key spec 'maximum)) (<= value (map-elt spec 'maximum)))))
+      ('multi-choice
+       (and (vectorp value) (= (length value) (length (seq-uniq value #'equal)))
+            (seq-every-p (lambda (choice) (member choice options)) value)))
+      (_ (and (stringp value) (member value options))))))
 
 (defun agent-shell--normalize-elicitation (schema)
   "Return a complete model for SCHEMA or a safe :reason alist."
@@ -179,30 +253,51 @@ Only `_meta.codex.isSecret' marks a supported sensitive property."
            (lambda (name spec)
              (agent-shell--elicitation-object
               spec (cond ((equal (map-elt spec 'type) "string")
-                          '(type title description _meta oneOf))
+                          '(type title description _meta oneOf enum default))
+                         ((member (map-elt spec 'type) '("number" "integer"))
+                          '(type title description _meta default minimum maximum))
+                         ((equal (map-elt spec 'type) "boolean")
+                          '(type title description _meta default))
                          ((equal (map-elt spec 'type) "array")
-                          '(type title description _meta items))
+                          '(type title description _meta items default))
                          (t (agent-shell--elicitation-reject 'unsupported-type))))
              (when (equal (map-elt spec 'type) "array")
-               (agent-shell--elicitation-object (map-elt spec 'items) '(anyOf)))
+               (agent-shell--elicitation-object (map-elt spec 'items) '(anyOf enum))
+               (when (and (map-contains-key (map-elt spec 'items) 'anyOf)
+                          (map-contains-key (map-elt spec 'items) 'enum))
+                 (agent-shell--elicitation-reject 'contradictory-choices)))
+             (when (and (map-contains-key spec 'oneOf) (map-contains-key spec 'enum))
+               (agent-shell--elicitation-reject 'contradictory-choices))
              (when-let* ((custom (agent-shell--elicitation-custom-field name spec)))
                (when (seq-find (lambda (other) (eq (map-elt other :question) (map-elt custom :question))) customs)
                  (agent-shell--elicitation-reject 'duplicate-companion))
                (push custom customs)))
            properties)
           (dolist (custom customs)
-            (unless (and (map-contains-key properties (map-elt custom :question))
-                         (not (seq-find (lambda (other) (eq (map-elt other :name) (map-elt custom :question))) customs)))
-              (agent-shell--elicitation-reject 'orphan-companion)))
+            (let ((next custom) seen)
+              (while next
+                (when (memq (map-elt next :name) seen)
+                  (agent-shell--elicitation-reject 'cyclic-companion))
+                (push (map-elt next :name) seen)
+                (setq next (seq-find
+                            (lambda (candidate)
+                              (eq (map-elt candidate :name) (map-elt next :question)))
+                            customs)))))
+          (setq customs
+                (seq-filter (lambda (custom)
+                              (let* ((target (map-elt properties (map-elt custom :question)))
+                                     (items (map-elt target 'items)))
+                                (or (map-contains-key target 'oneOf)
+                                    (map-contains-key target 'enum)
+                                    (map-contains-key items 'anyOf)
+                                    (map-contains-key items 'enum))))
+                            customs))
           (map-do
            (lambda (name spec)
              (unless (seq-find (lambda (custom) (eq (map-elt custom :name) name)) customs)
                (let* ((custom (seq-find (lambda (entry) (eq (map-elt entry :question) name)) customs))
                       (field (agent-shell--elicitation-field name spec custom)))
                  (when custom
-                   (when (or (seq-contains-p required (symbol-name name))
-                             (seq-contains-p required (symbol-name (map-elt custom :name))))
-                     (agent-shell--elicitation-reject 'required-exclusive-branch))
                    (when (map-elt (agent-shell--elicitation-metadata (map-elt properties (map-elt custom :name))) :secret)
                      (agent-shell--elicitation-put! field :secret t)))
                  (when (map-elt field :secret)
@@ -231,21 +326,16 @@ The result contains :reason and :field; it never contains answer values."
         (let* ((name (map-elt field :name))
                (companion (map-elt field :custom))
                (custom (map-elt companion :name))
-               (value (map-elt content name))
-               (options (mapcar (lambda (option) (map-elt option :value)) (map-elt field :options))))
+               (value (map-elt content name)))
           (push name allowed)
           (when companion (push custom allowed))
-          (when (or (and (map-contains-key content name) companion (map-contains-key content custom))
+          (when (or (and (not (map-elt field :multi))
+                          (map-contains-key content name) companion (map-contains-key content custom))
                     (and companion (map-contains-key content custom) (not (stringp (map-elt content custom))))
                     (and (map-contains-key content name)
-                         (not (cond ((eq (map-elt field :kind) 'text) (stringp value))
-                                    ((map-elt field :multi)
-                                     (and (vectorp value)
-                                          (= (length value) (length (seq-uniq value #'equal)))
-                                          (seq-every-p (lambda (choice) (member choice options)) value)))
-                                    (t (and (stringp value) (member value options))))))
+                         (not (agent-shell--elicitation-value-valid-p field value)))
                     (seq-some (lambda (key) (and (memq key (map-elt elicitation :required))
-                                                 (not (map-contains-key content key))))
+                                                 (not (agent-shell--elicitation-field-answered-p content field))))
                               (append (list name) (when companion (list custom)))))
             (throw 'invalid (list (cons :reason 'invalid-or-required-answer) (cons :field name))))))
       (unless (and (seq-every-p (lambda (entry) (memq (car entry) allowed)) content)
@@ -340,25 +430,35 @@ FIELD, VALUE, SUBMIT and OPERATION select the edit or terminal action."
                 ('skip (agent-shell--finish-elicitation :state state :request-id request-id :client client
                                                         :token token :action "decline" :reason 'user-skipped))
                 ('submit (agent-shell--submit-elicitation :state state :request-id request-id :client client))
+                ('preview
+                 (let ((key (cons (map-elt field :name) value)))
+                   (agent-shell--elicitation-put!
+                    record :previews
+                    (if (member key (map-elt record :previews))
+                        (remove key (map-elt record :previews))
+                      (cons key (map-elt record :previews))))
+                   (agent-shell--elicitation-put! record :focus-option key)
+                   (agent-shell--render-elicitation
+                    :state state :request-id request-id :client client)))
                 ((or 'edit 'other)
                  (let* ((name (if (eq operation 'other) (map-nested-elt field '(:custom :name)) (map-elt field :name)))
                         (old (map-elt (map-elt record :answers) name))
                         (prompt (if (eq operation 'other) (agent-shell--elicitation-custom-prompt field) "Answer: "))
-                        (text (if (map-elt field :secret)
-                                  (read-passwd prompt)
-                                (read-string prompt old))))
+                        (text (agent-shell--elicitation-read-value field prompt old operation)))
                    (when (and (agent-shell--elicitation-current state request-id client token)
                               (agent-shell--elicitation-connected-p state client))
                      (agent-shell--answer-elicitation
                       :state state :request-id request-id :client client :field-name name
-                      :value (unless (string-empty-p text) text)
-                      :clear (when (eq operation 'other) (list (map-elt field :name)))
-                      :submit (and submit (not (string-empty-p text)))))))
+                      :value (unless (equal text "") text)
+                      :clear (when (and (eq operation 'other) (not (map-elt field :multi)))
+                                (list (map-elt field :name)))
+                      :submit (and submit (not (equal text "")))))))
                 (_
                  (agent-shell--answer-elicitation
                   :state state :request-id request-id :client client
                   :field-name (if (eq operation 'clear-other) (map-nested-elt field '(:custom :name)) (map-elt field :name))
-                  :clear (when (and (not (memq operation '(clear clear-other))) (map-elt field :custom))
+                  :clear (when (and (not (map-elt field :multi))
+                                    (not (memq operation '(clear clear-other))) (map-elt field :custom))
                            (list (map-nested-elt field '(:custom :name))))
                   :value (pcase operation
                            ((or 'clear 'clear-other) nil)
@@ -543,7 +643,9 @@ For example:
 
 
    ╰─"
-  (let* ((message (map-elt elicitation :message))
+  (let* ((message (let ((text (map-elt elicitation :message))
+                        (title (map-nested-elt state (list :tool-calls (map-elt elicitation :tool-call-id) :title))))
+                    (unless (and title (equal title text)) text)))
          (fields (map-elt elicitation :fields))
          (answers (agent-shell--elicitation-redact
                    (map-elt elicitation :answers) (map-elt elicitation :sensitive)))
@@ -566,6 +668,8 @@ For example:
          ;; of this map binding its own digits.  The map rides on the
          ;; button as a text property, so point picks the question.
          (keymap (let ((map (make-sparse-keymap)))
+                   (define-key map (kbd "TAB") #'agent-shell-elicitation-next-field)
+                   (define-key map (kbd "<backtab>") #'agent-shell-elicitation-previous-field)
                    (define-key map (kbd "s") skip-action)
                    (define-key map (kbd "c") submit-action)
                    (define-key map (kbd "C-<return>") submit-action)
@@ -649,7 +753,13 @@ For example:
                                    (set-keymap-parent option-keymap field-keymap)
                                    (define-key option-keymap (kbd "C-<return>")
                                                (funcall option-command option t))
-                                   (agent-shell--make-permission-button
+                                   (when (map-elt option :preview)
+                                     (define-key option-keymap (kbd "p")
+                                                 (agent-shell--elicitation-control
+                                                  :state state :request-id request-id :client client
+                                                  :field field :value value :operation 'preview)))
+                                   (concat
+                                    (agent-shell--make-permission-button
                                     ;; The hotkey stays last:
                                     ;; `agent-shell--make-permission-button'
                                     ;; derives the navigatable character
@@ -661,7 +771,8 @@ For example:
                                             (format "%s %s"
                                                     (agent-shell--elicitation-glyph multi selected)
                                                     (map-elt option :title)))
-                                    :help (or (map-elt option :description)
+                                    :help (or (map-elt option :preview)
+                                              (map-elt option :description)
                                               (map-elt option :title))
                                     :action (funcall option-command option nil)
                                     :keymap option-keymap
@@ -674,11 +785,17 @@ For example:
                                     :option (if chord-submits
                                                 (format "%s %s, or C-RET to %s and submit"
                                                         verb (map-elt option :title) verb)
-                                              (format "%s %s" verb (map-elt option :title))))))
+                                              (format "%s %s" verb (map-elt option :title))))
+                                    (when-let* ((preview (map-elt option :preview)))
+                                      (if (member (cons (map-elt field :name) value)
+                                                  (map-elt elicitation :previews))
+                                          (concat "\n        "
+                                                  (replace-regexp-in-string "\n" "\n        " preview t t))
+                                        "  (p: preview)")))))
                                (map-elt field :options))
-                              (when (eq (map-elt field :kind) 'text)
+                              (when (memq (map-elt field :kind) '(text boolean number integer))
                                 (append
-                                 (when answer (list (if (map-elt field :secret) "[secret entered]" answer)))
+                                 (when answer (list (if (map-elt field :secret) "[secret entered]" (format "%s" answer))))
                                  (agent-shell--make-elicitation-edit-buttons
                                   :state state :request-id request-id :client client :field field
                                   :keymap field-keymap :focus (eq field pending))))
@@ -754,12 +871,14 @@ the same block id, so a recorded answer replaces the form in place."
      :block-id (or (map-elt elicitation :block-id) (agent-shell--elicitation-block-id request-id))
      :body (propertize
             (with-current-buffer (map-elt state :buffer)
-              (agent-shell--make-elicitation-text
-               :elicitation elicitation
-               :request-id request-id
-               :client client
-               :state state))
-            'agent-shell-elicitation-token (map-elt elicitation :token))
+              (agent-shell--elicitation-mark-control-starts
+               (agent-shell--make-elicitation-text
+                :elicitation elicitation
+                :request-id request-id
+                :client client
+                :state state)))
+            'agent-shell-elicitation-token (map-elt elicitation :token)
+            'agent-shell-elicitation-form-start t)
      :expanded t
      :navigation 'never
      :above-last-prompt (not (agent-shell--active-requests-p state)))
@@ -907,10 +1026,34 @@ DISCONNECTED retires an old connection without sending a response."
            (delivery 'not-attempted))
       (when (and (equal action "accept") (agent-shell--elicitation-invalid-field record content))
         (error "Invalid ACP form content"))
+      (when (equal action "accept")
+        (setq answers (copy-tree answers t))
+        (dolist (field (map-elt record :fields))
+          (let* ((name (map-elt field :name))
+                 (custom (map-nested-elt field '(:custom :name)))
+                 (typed (and custom (map-elt answers custom))))
+            (when (and (eq (map-elt field :kind) 'boolean)
+                       (not (eq (map-elt answers name) t))
+                       (not (memq name (map-elt record :required)))
+                       (not (map-elt field :has-default)))
+              (setq answers (assq-delete-all name answers)))
+            (when (and (map-elt field :multi) (map-nested-elt field '(:custom :join-multi))
+                       (stringp typed) (not (string-empty-p typed)))
+              (let ((combined (string-join (append (map-elt answers name) (list typed)) ", ")))
+                (setq answers (assq-delete-all name answers))
+                (setcdr (assq custom answers) combined)))))
+        (setq redacted (agent-shell--elicitation-redact answers (map-elt record :sensitive))
+              response (acp-make-elicitation-create-response
+                        :request-id request-id :action action
+                        :content (or answers (make-hash-table :test #'equal)))))
       (when response
         (agent-shell--elicitation-put! response :log-result
                                        (map-elt (acp-make-elicitation-create-response
-                                                 :request-id request-id :action action :content redacted :error error) :result)))
+                                                 :request-id request-id :action action
+                                                  :content (if (equal action "accept")
+                                                               (or redacted (make-hash-table :test #'equal))
+                                                             redacted)
+                                                  :error error) :result)))
       (agent-shell--elicitation-put! record :status 'finishing)
       (unwind-protect
           (when (and (not disconnected) response (agent-shell--elicitation-connected-p state client))
@@ -937,6 +1080,10 @@ DISCONNECTED retires an old connection without sending a response."
                  :state state :block-id (or (map-elt record :block-id)
                                             (agent-shell--elicitation-block-id request-id)))
               (error nil))
+            (when (and sent action)
+              (condition-case nil
+                  (agent-shell--elicitation-settle-record state record action redacted)
+                (error nil)))
             (when (eq (map-elt state :elicitation-idle-token) (map-elt record :token))
               (condition-case nil (agent-shell--cancel-idle-timer) (error nil))
               (agent-shell--elicitation-put! state :elicitation-idle-token nil))
@@ -1000,10 +1147,16 @@ DISCONNECTED retires an old connection without sending a response."
                            (cons :block-id (format "elicitation-%s" (symbol-name (gensym)))))))
         (agent-shell--save-elicitation state request-id record)
         (condition-case nil
-            (let* ((model (if (equal (map-nested-elt acp-request '(params mode)) "form")
+            (let* ((mode (map-nested-elt acp-request '(params mode)))
+                   (protocol-error
+                    (cond ((not agent-shell-elicitation-capability)
+                           (acp-make-error :code -32601 :message "ACP elicitation is disabled"))
+                          ((not (equal mode "form"))
+                           (acp-make-error :code -32602 :message "Unadvertised ACP elicitation mode"))))
+                   (model (if (equal mode "form")
                               (agent-shell--normalize-elicitation (map-nested-elt acp-request '(params requestedSchema)))
                             '((:reason . unsupported-mode))))
-                   (reason (map-elt model :reason)))
+                   (reason (or (and protocol-error 'protocol-error) (map-elt model :reason))))
               (if reason
                   (progn
                     (agent-shell--elicitation-notice
@@ -1011,8 +1164,34 @@ DISCONNECTED retires an old connection without sending a response."
                      (format "agent-shell cannot display this form because its ACP form support does not support this schema feature (%s; %s)."
                              reason (map-elt record :block-id)))
                     (agent-shell--finish-elicitation :state state :request-id request-id :client client
-                                                     :token token :action "decline" :reason 'unsupported))
+                                                     :token token :action (unless protocol-error "decline")
+                                                     :error protocol-error :reason 'unsupported))
                 (map-do (lambda (key value) (agent-shell--elicitation-put! record key value)) model)
+                (agent-shell--elicitation-put!
+                 record :answers
+                 (seq-mapcat
+                  (lambda (field)
+                    (let* ((name (map-elt field :name))
+                           (custom (map-nested-elt field '(:custom :name)))
+                           (spec (map-elt (map-elt record :properties) name))
+                           (custom-spec (and custom (map-elt (map-elt record :properties) custom)))
+                           (custom-default (map-elt custom-spec 'default))
+                           ;; Match the provider's Other precedence without
+                           ;; retaining defaults in public fields or controls.
+                           (custom-answer (and (stringp custom-default)
+                                               (not (string-empty-p custom-default))
+                                               (cons custom (copy-sequence custom-default))))
+                           (answer
+                            (cond
+                             ((map-contains-key spec 'default)
+                              (cons name (copy-tree (map-elt spec 'default) t)))
+                             ((and (eq (map-elt field :kind) 'boolean)
+                                   (memq name (map-elt record :required)))
+                              (cons name :false)))))
+                      (delq nil (list (unless (and custom-answer (not (map-elt field :multi))) answer)
+                                      custom-answer))))
+                  (map-elt record :fields)))
+                (agent-shell--elicitation-put! record :properties nil)
                 (agent-shell--elicitation-put! record :message (map-nested-elt acp-request '(params message)))
                 (agent-shell--elicitation-put! record :tool-call-id (map-nested-elt acp-request '(params toolCallId)))
                 (agent-shell--render-elicitation :state state :request-id request-id :client client)
@@ -1029,6 +1208,180 @@ DISCONNECTED retires an old connection without sending a response."
            (agent-shell--finish-elicitation
             :state state :request-id request-id :client client :token token :reason 'failed
             :error (acp-make-error :code -32603 :message "Unable to display ACP form"))))))))
+
+(defun agent-shell--elicitation-mark-control-starts (text)
+  "Move TEXT's navigation stops to each control's beginning, retaining focus."
+  (let ((position 0))
+    (while (< position (length text))
+      (let ((next (next-single-property-change position 'button text (length text))))
+        (when (get-text-property position 'button text)
+          (remove-text-properties position next '(agent-shell-permission-button nil) text)
+          (put-text-property position (1+ position) 'agent-shell-permission-button t text))
+        (setq position next))))
+  text)
+
+;;; Navigation
+
+(defun agent-shell-elicitation--move-control (backward)
+  "Move to the next form control, or the previous one when BACKWARD."
+  (let ((position (point)) found)
+    (while (and (not found)
+                (setq position
+                      (if backward
+                          (previous-single-property-change position 'agent-shell-permission-button)
+                        (next-single-property-change position 'agent-shell-permission-button))))
+      (when (and (get-text-property position 'agent-shell-permission-button)
+                 (get-text-property position 'agent-shell-elicitation-token))
+        (setq found position)))
+    (when found (deactivate-mark) (goto-char found) found)))
+
+(defun agent-shell-elicitation-next-field ()
+  "Move to the next interactive form control."
+  (interactive)
+  (agent-shell-elicitation--move-control nil))
+
+(defun agent-shell-elicitation-previous-field ()
+  "Move to the previous interactive form control."
+  (interactive)
+  (agent-shell-elicitation--move-control t))
+
+(defun agent-shell-elicitation-jump-to-latest-form ()
+  "Reveal the beginning of the latest pending form in every window."
+  (interactive)
+  (when-let* ((position (save-excursion
+                         (goto-char (point-max))
+                         (let ((match (text-property-search-backward
+                                       'agent-shell-elicitation-form-start t t)))
+                           (when match (prop-match-beginning match))))))
+    (goto-char position)
+    (let* ((token (get-text-property position 'agent-shell-elicitation-token))
+           (record (seq-find
+                    (lambda (entry) (eq token (map-elt (cdr entry) :token)))
+                    (map-elt (agent-shell--state) :elicitations)))
+           (form (cdr record))
+           (fields (map-elt form :fields))
+           (heading (if (= (length fields) 1)
+                        (agent-shell--elicitation-field-label (car fields) (map-elt form :message))
+                      (map-elt form :message)))
+           (end (or (next-single-property-change position 'agent-shell-elicitation-token)
+                    (point-max))))
+      (when (and heading (search-forward heading end t))
+        (goto-char (match-beginning 0))))
+    (deactivate-mark)
+    (dolist (window (get-buffer-window-list (current-buffer) nil t))
+      (set-window-point window (point)))
+    t))
+
+(defun agent-shell-elicitation-interrupt ()
+  "Cancel pending forms through the shell's guarded completion path."
+  (interactive)
+  (let* ((shell (if (derived-mode-p 'agent-shell-mode) (current-buffer)
+                  (agent-shell-viewport--shell-buffer)))
+         (state (and (buffer-live-p shell)
+                     (with-current-buffer shell (agent-shell--state)))))
+    (when state
+      (dolist (entry (copy-sequence (map-elt state :elicitations)))
+        (agent-shell--finish-elicitation
+         :state state :request-id (car entry) :client (map-elt state :client)
+         :token (map-elt (cdr entry) :token) :action "cancel" :reason 'locally-canceled)))))
+
+(defun agent-shell-elicitation-act ()
+  "Activate the form control at point."
+  (interactive)
+  (when-let* ((map (get-text-property (point) 'keymap))
+              (action (lookup-key map (kbd "RET")))
+              ((commandp action)))
+    (call-interactively action)))
+
+;;; Tool-call integration
+
+(defun agent-shell--elicitation-settle-record (state record action redacted)
+  "Leave a safe summary for RECORD in STATE after ACTION with REDACTED answers."
+  (let ((tool-call (map-elt (map-elt state :tool-calls) (map-elt record :tool-call-id))))
+    (unless (agent-shell-elicitation--questionnaire-p (map-elt tool-call :raw-input))
+      (agent-shell--update-fragment
+       :state state :namespace-id (map-elt record :namespace-id)
+       :block-id (concat (map-elt record :block-id) "-settled")
+       :body (string-join
+              (append (list (or (map-elt record :message) "Question")
+                            (pcase action ("accept" "Answered") ("decline" "Skipped") (_ "Canceled")))
+                      (mapcar
+                       (lambda (entry)
+                         (let ((field (seq-find
+                                       (lambda (field)
+                                         (or (eq (car entry) (map-elt field :name))
+                                             (eq (car entry) (map-nested-elt field '(:custom :name)))))
+                                       (map-elt record :fields))))
+                           (format "%s: %s"
+                                   (or (map-elt field :title) (map-elt field :name) (car entry))
+                                   (cdr entry))))
+                       redacted))
+              "\n")
+       :expanded t :navigation 'never
+       :above-last-prompt (not (agent-shell--active-requests-p state))))))
+
+(cl-defun agent-shell-elicitation--tool-call-records-p (&key state id)
+  "Return non-nil when ID's tool call in STATE records its questionnaire."
+  (when-let* ((tool-call-id (map-nested-elt state (list :elicitations id :tool-call-id))))
+    (agent-shell-elicitation--questionnaire-p
+     (map-nested-elt state (list :tool-calls tool-call-id :raw-input)))))
+
+(defconst agent-shell-elicitation--option-meta-key '_claude/askUserQuestionOption
+  "ACP option metadata key containing preview text.")
+
+(defun agent-shell-elicitation--option-preview (option)
+  "Return validated preview text attached to OPTION, or nil."
+  (let* ((meta (map-elt option '_meta))
+         (preview-meta (map-elt meta agent-shell-elicitation--option-meta-key)))
+    (when (map-contains-key meta agent-shell-elicitation--option-meta-key)
+      (agent-shell--elicitation-object preview-meta '(preview))
+      (unless (stringp (map-elt preview-meta 'preview))
+        (agent-shell--elicitation-reject 'malformed-preview))
+      (map-elt preview-meta 'preview))))
+
+(defconst agent-shell-elicitation--advertised-modes '("form")
+  "ACP elicitation modes supported by the form renderer.")
+
+(defun agent-shell-elicitation--questionnaire-p (raw-input)
+  "Return non-nil for RAW-INPUT with a nonempty questionnaire."
+  (let ((questions (and (listp raw-input) (map-elt raw-input 'questions))))
+    (and (or (vectorp questions) (listp questions))
+         (not (seq-empty-p questions))
+         (seq-every-p (lambda (question)
+                        (and (listp question)
+                             (stringp (map-elt question 'question))))
+                      questions))))
+
+(cl-defun agent-shell-elicitation--pending-for-tool-call-p (&key state tool-call-id)
+  "Return the pending form in STATE associated with TOOL-CALL-ID."
+  (when tool-call-id
+    (seq-find (lambda (entry)
+                (let ((record (cdr entry)))
+                  (and (eq (map-elt record :status) 'pending)
+                       (equal (map-elt record :tool-call-id) tool-call-id)
+                       (agent-shell--elicitation-current
+                        state (car entry) (map-elt state :client)))))
+              (map-elt state :elicitations))))
+
+(cl-defun agent-shell-elicitation--clear (&key state)
+  "Drop settled forms from STATE without orphaning pending requests.
+
+The normal completion path already removes settled forms.  Preserve pending
+records and their active requests if reset runs before cancellation.  Keep
+terminal request identities until connection retirement to reject replays."
+  (agent-shell--elicitation-put!
+   state :elicitations
+   (seq-filter (lambda (entry)
+                 (memq (map-elt (cdr entry) :status) '(nil pending finishing)))
+               (map-elt state :elicitations)))
+  (agent-shell--elicitation-put!
+   state :active-requests
+   (seq-remove
+    (lambda (request)
+      (and (equal (map-elt request :method) "elicitation/create")
+           (not (map-contains-key (map-elt state :elicitations)
+                                  (map-elt request :request-id)))))
+    (map-elt state :active-requests))))
 
 (provide 'agent-shell-elicitation)
 ;;; agent-shell-elicitation.el ends here
