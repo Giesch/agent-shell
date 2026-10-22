@@ -331,10 +331,11 @@ follows it instead."
     (let ((marker (concat agent-shell-chat--body-indent agent-shell-chat--prompt)))
       ;; A fallback font may draw the chevron narrower than one column.
       ;; Compose it over a normal space so it advances by a body-font column.
+      ;; Align baselines to keep the chevron level with the input text.
       ;; Unlike a nested `display', composition works inside overlay strings.
       (compose-string marker (length agent-shell-chat--body-indent)
                       (1+ (length agent-shell-chat--body-indent))
-                      '(?\s (mc . mc) ?❯))
+                      '(?\s (Bc . Bc) ?❯))
       (propertize marker 'face 'default))))
 
 (defun agent-shell-chat--find-live-marker-overlay ()
