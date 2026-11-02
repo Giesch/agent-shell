@@ -905,6 +905,37 @@ block -- covering the dispatch path, not just the helper in isolation."
         (should-not (map-elt state :stream-render-pending))
         (should-not (map-elt state :stream-render-timer))))))
 
+(ert-deftest agent-shell--stream-render-flushes-on-session-push-end-test ()
+  "A pushed turn's pending text renders before the next turn starts.
+
+`session_push_end' finishes the turn and dispatches any queued prompt,
+which bumps `:request-count'.  A batch left pending until then would
+render under the queued prompt's namespace, after its text."
+  (with-temp-buffer
+    (let ((agent-shell--stream-render-interval 30)
+          (state (agent-shell--make-state :buffer (current-buffer)))
+          (rendered nil))
+      (map-put! state :request-count 1)
+      (cl-letf (((symbol-function 'agent-shell--update-fragment)
+                 (lambda (&rest _)
+                   (push (map-elt state :request-count) rendered)))
+                ((symbol-function 'agent-shell-experimental--on-session-push-end)
+                 (lambda (&rest _)
+                   (should rendered)
+                   ;; Stand in for the queued prompt `on-finished' dispatches.
+                   (map-put! state :request-count 2))))
+        (agent-shell--update-streamed-fragment
+         :state state :block-id "a" :body "pushed answer")
+        (agent-shell--on-notification
+         :state state
+         :acp-notification '((method . "session/update")
+                             (params
+                              (update
+                               (sessionUpdate . "session_push_end")))))
+        (should (equal rendered '(1)))
+        (should-not (map-elt state :stream-render-pending))
+        (should-not (map-elt state :stream-render-timer))))))
+
 (ert-deftest agent-shell--on-notification-session-info-update-test ()
   "Test `session_info_update' updates the session title.
 
@@ -1050,6 +1081,35 @@ highlighting."
         (with-current-buffer (find-buffer-visiting temp-file)
           (set-buffer-modified-p nil)))
       (ignore-errors (delete-file temp-file)))))
+
+(ert-deftest agent-shell--get-region-context-labels-line-numbers ()
+  "Region context label lists a single line once and a range otherwise.
+
+For example, \"region.el:2\" for a single-line region and
+\"region.el:1-3\" for a multi-line one."
+  (let ((project-dir (file-name-as-directory
+                      (make-temp-file "agent-shell-region" t))))
+    (unwind-protect
+        (with-temp-buffer
+          (insert "one\ntwo\nthree\n")
+          (setq buffer-file-name (expand-file-name "region.el" project-dir))
+          (set-buffer-modified-p nil)
+          (goto-char (point-min))
+          (forward-line 1)
+          (set-mark (point))
+          (end-of-line)
+          (activate-mark)
+          (should (string-prefix-p "region.el:2\n"
+                                   (agent-shell--get-region-context
+                                    :agent-cwd project-dir)))
+          (set-mark (point-min))
+          (goto-char (point-max))
+          (activate-mark)
+          (should (string-prefix-p "region.el:1-3\n"
+                                   (agent-shell--get-region-context
+                                    :agent-cwd project-dir)))
+          (setq buffer-file-name nil))
+      (delete-directory project-dir t))))
 
 (ert-deftest agent-shell--get-numbered-region-preserves-source-faces-only ()
   "Numbered region preview must keep faces but not source control properties.
@@ -2291,6 +2351,56 @@ fast: requesting on... done"))
     (should (equal (map-elt (car (map-elt state :config-options)) :current-value)
                    "code"))))
 
+(ert-deftest agent-shell--usage-update-emits-event-test ()
+  "Test usage_update emits `usage-update' with :usage and raw :meta."
+  (let ((state (list (cons :usage (list (cons :context-used 0)
+                                        (cons :context-size 0)))
+                     (cons :last-activity-time nil)))
+        (emitted nil))
+    (cl-letf (((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               (lambda (&rest args)
+                 (push args emitted))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification '((method . "session/update")
+                           (params
+                            (update
+                             (sessionUpdate . "usage_update")
+                             (used . 1000)
+                             (size . 200000)
+                             (_meta (_claude/rateLimit (status . "allowed"))))))))
+    (should (equal (plist-get (car emitted) :event) 'usage-update))
+    (should (equal (map-nested-elt (plist-get (car emitted) :data) '(:usage :context-used))
+                   1000))
+    (should (equal (map-elt (plist-get (car emitted) :data) :meta)
+                   '((_claude/rateLimit (status . "allowed")))))))
+
+(ert-deftest agent-shell--config-option-update-emits-meta-test ()
+  "Test config_option_update passes the notification's `_meta' as :meta."
+  (let ((state (list (cons :session (list (cons :id "session-1")
+                                          (cons :config-options nil)))
+                     (cons :config-options nil)
+                     (cons :last-activity-time nil)))
+        (emitted nil))
+    (cl-letf (((symbol-function 'agent-shell--update-header-and-mode-line)
+               #'ignore)
+              ((symbol-function 'agent-shell--emit-event)
+               (lambda (&rest args)
+                 (push args emitted))))
+      (agent-shell--on-notification
+       :state state
+       :acp-notification '((method . "session/update")
+                           (params
+                            (update
+                             (sessionUpdate . "config_option_update")
+                             (configOptions . [])
+                             (_meta (foo . "bar")))))))
+    (should (equal (plist-get (car emitted) :event) 'config-option-update))
+    (should (equal (map-elt (plist-get (car emitted) :data) :meta)
+                   '((foo . "bar"))))))
+
 (ert-deftest agent-shell--config-option-set-model-id-config-option-test ()
   "Test model changes prefer session config options."
   (let* ((initial-config-options [((id . "model")
@@ -2731,22 +2841,24 @@ fast: requesting on... done"))
 
 (ert-deftest agent-shell--make-transcript-frontmatter-test ()
   "Test `agent-shell--make-transcript-frontmatter' function."
-  ;; All fields present.
+  ;; All fields present.  Times render as unquoted YAML timestamps.
   (should (equal (agent-shell--make-transcript-frontmatter
-                  '(("agent" . "Claude")
-                    ("started" . "2025-11-02T18:17:41-05:00")
+                  `(("agent" . "Claude")
+                    ("started" . ,(encode-time '(41 17 18 2 11 2025 nil nil -18000)))
                     ("working_directory" . "/home/user/project/")
                     ("session_id" . "eb5b6105")
                     ("model" . "opus")))
-                 "---
+                 (format "---
 agent: \"Claude\"
-started: \"2025-11-02T18:17:41-05:00\"
+started: %s
 working_directory: \"/home/user/project/\"
 session_id: \"eb5b6105\"
 model: \"opus\"
 ---
 
-"))
+"
+                         (format-time-string "%FT%T%:z"
+                                             (encode-time '(41 17 18 2 11 2025 nil nil -18000))))))
   ;; Nil values omit their key entirely.
   (should (equal (agent-shell--make-transcript-frontmatter
                   '(("agent" . "Claude")
@@ -5306,6 +5418,57 @@ Scaling an exact cent overshoots it, for example (* 0.07 100) is
                          (agent-shell--svg-fill-color 'agent-shell-secondary))
                  svg-data))))))
 
+(ert-deftest agent-shell--make-header-graphical-ignores-image-scaling-factor-test ()
+  "Test graphical header image is not scaled by `image-scaling-factor'.
+
+The header SVG is already sized in pixels, so automatic scaling on
+displays with wide default fonts would make it overflow the header line."
+  (skip-unless (image-type-available-p 'svg))
+  (with-temp-buffer
+    (setq-local agent-shell--state
+                `((:agent-config . ((:buffer-name . "Test")
+                                    (:icon-name . nil)))
+                  (:session . ((:id . "abc")
+                               (:model-id . nil)
+                               (:models . nil)
+                               (:mode-id . nil)
+                               (:modes . nil)))))
+    (cl-letf (((symbol-function 'agent-shell--state)
+               (lambda () agent-shell--state))
+              ((symbol-function 'agent-shell--context-usage-indicator)
+               (lambda () nil))
+              ((symbol-function 'agent-shell--busy-indicator-frame)
+               (lambda () nil))
+              ((symbol-function 'agent-shell--session-id-indicator)
+               (lambda () nil)))
+      (let* ((agent-shell-header-style 'graphical)
+             (agent-shell--header-cache nil)
+             (image-scaling-factor 2.0)
+             (header (agent-shell--make-header agent-shell--state))
+             (image (get-text-property 1 'display header)))
+        (should (eq (car-safe image) 'image))
+        (should (equal (image-property image :scale) 1))))))
+
+(ert-deftest agent-shell--config-icon-ignores-image-scaling-factor-test ()
+  "Test `agent-shell--config-icon' is not scaled by `image-scaling-factor'.
+
+The icon is sized to `frame-char-height', which is already in pixels, so
+automatic scaling on displays with wide default fonts would make it
+taller than a line."
+  (skip-unless (image-type-available-p 'svg))
+  (let ((icon-file (make-temp-file "agent-shell-icon" nil ".svg"
+                                   "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"/>")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell--make-agent-fallback-icon)
+                   (lambda (_name _width) icon-file)))
+          (let* ((image-scaling-factor 2.0)
+                 (icon (agent-shell--config-icon
+                        :config '((:buffer-name . "Test"))))
+                 (image (get-text-property 0 'display icon)))
+            (should (eq (car-safe image) 'image))
+            (should (equal (image-property image :scale) 1))))
+      (delete-file icon-file))))
+
 ;;; Tests for agent-shell--permission-title
 
 (ert-deftest agent-shell--permission-title-read-shows-filename-test ()
@@ -7419,6 +7582,7 @@ Returns the resulting buffer string, with the live prompt trailing."
                        (lambda (_state) 'last))
                       ((symbol-function 'agent-shell--replay-turn)
                        (lambda (state _turn)
+                         (should-not (shell-maker--should-auto-scroll-p))
                          (let ((inhibit-read-only t))
                            (goto-char (point-max))
                            (insert "Claude> replayed"))
@@ -7915,6 +8079,44 @@ Major-mode changes keep `buffer-undo-list', so each view page's
             (undo)
             (should (string-empty-p (buffer-string)))))
       (kill-buffer viewport-buffer))))
+
+(ert-deftest agent-shell-viewport--show-buffer-displays-after-populating-test ()
+  "The display action sees the viewport's compose content, not stale content.
+
+Display actions sizing the window to its buffer (e.g. a `window-height'
+function calling `fit-window-to-buffer') otherwise measure a page left
+over from view mode."
+  (let* ((agent-shell-file-completion-enabled nil)
+         (shell-buffer (generate-new-buffer "*agent-shell display test*"))
+         (viewport-buffer (generate-new-buffer "*agent-shell display test* [viewport]"))
+         (seen nil)
+         (agent-shell-display-action
+          `(display-buffer-at-bottom
+            (window-height
+             . ,(lambda (window)
+                  (with-current-buffer (window-buffer window)
+                    (setq seen `((:mode . ,major-mode)
+                                 (:content . ,(buffer-string))))))))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'agent-shell-viewport--buffer)
+                   (lambda (&rest _) viewport-buffer))
+                  ((symbol-function 'agent-shell-viewport--busy-p)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--position)
+                   (lambda (&rest _) nil))
+                  ((symbol-function 'agent-shell-viewport--update-header)
+                   (lambda (&rest _))))
+          (with-current-buffer viewport-buffer
+            (agent-shell-viewport-view-mode)
+            (agent-shell-viewport--initialize :prompt "old prompt\n" :response "old response"))
+          (save-window-excursion
+            (agent-shell-viewport--show-buffer :append "some context"
+                                               :shell-buffer shell-buffer))
+          (should (eq (map-elt seen :mode) 'agent-shell-viewport-edit-mode))
+          (should (string-match-p "some context" (map-elt seen :content)))
+          (should-not (string-match-p "old response" (map-elt seen :content))))
+      (kill-buffer viewport-buffer)
+      (kill-buffer shell-buffer))))
 
 (ert-deftest agent-shell--refresh-session-title-skips-when-list-unsupported ()
   "Test `agent-shell--refresh-session-title' sends no request without `list'.
@@ -8670,6 +8872,16 @@ tense while any member is still unfinished."
     (should (equal "a.el" (agent-shell--raw-input-file-path
                           (list (cons key "a.el")))))))
 
+(ert-deftest agent-shell--raw-input-command-test ()
+  "Read the command under either key and normalize argv vectors."
+  (should (equal "ls -la" (agent-shell--raw-input-command
+                           '((command . "ls -la")))))
+  (should (equal "ls -la" (agent-shell--raw-input-command
+                           '((command_line . "ls -la") (working_dir . "/tmp")))))
+  (should (equal "ls -la" (agent-shell--raw-input-command
+                           '((command . ["ls" "-la"])))))
+  (should-not (agent-shell--raw-input-command '((path . "a.el")))))
+
 (ert-deftest agent-shell--activity-group-edit-file-count-test ()
   "Edit summaries count distinct files and handle missing paths."
   (let ((call '((:kind . "edit") (:status . "completed")
@@ -8866,6 +9078,46 @@ such a body layers its own faces ahead of the base one."
                     :acp-notification '((some-key . "some-value")))
                   '((adapted . t) (some-key . "some-value"))))))
 
+(ert-deftest agent-shell--subscribe-to-client-events-notification-handler-test ()
+  "Test adapter, provider handler and core run in order.
+A handled notification skips core but still records activity."
+  (dolist (handled '(nil t))
+    (with-temp-buffer
+      (let* ((calls nil)
+             (handler-state nil)
+             (state (agent-shell--make-state
+                     :buffer (current-buffer)
+                     :agent-config
+                     (agent-shell-make-agent-config
+                      :identifier 'test
+                      :notification-adapter
+                      (lambda (&rest args)
+                        (push 'adapter calls)
+                        (cons '(adapted . t) (plist-get args :acp-notification)))
+                      :notification-handler
+                      (lambda (event)
+                        (setq handler-state (map-elt event :state))
+                        (should (map-nested-elt event '(:acp-notification adapted)))
+                        (push 'handler calls)
+                        handled)))))
+        (map-put! state :client (acp-make-client
+                                :command "unused"
+                                :context-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'agent-shell--on-notification)
+                   (lambda (&rest args)
+                     (should (map-elt (plist-get args :acp-notification) 'adapted))
+                     (push 'core calls))))
+          (agent-shell--subscribe-to-client-events :state state)
+          (dolist (handler (map-nested-elt state '(:client :notification-handlers)))
+            (funcall handler '((method . "_example/status")))))
+        (should (eq handler-state state))
+        ;; Core is stubbed, so only a handled notification records activity.
+        (should (eq (and (map-elt state :last-activity-time) t) handled))
+        (should (equal (reverse calls)
+                       (if handled
+                           '(adapter handler)
+                         '(adapter handler core))))))))
+
 (ert-deftest agent-shell--buffer-name-prefix-test ()
   "Test `agent-shell--buffer-name-prefix' across formats."
   (let ((agent-shell-buffer-name-format 'default))
@@ -8912,6 +9164,77 @@ such a body layers its own faces ahead of the base one."
           (insert "streamed")
           (put-text-property out-start (point) 'field 'output))
         (should-not (agent-shell--live-input-prompt-p prompt))))))
+
+(ert-deftest agent-shell--prompt-face-p-test ()
+  "Prompt runs are recognized whether the face is a symbol or a list."
+  (should (agent-shell--prompt-face-p 'comint-highlight-prompt))
+  (should (agent-shell--prompt-face-p 'agent-shell-prompt))
+  (should (agent-shell--prompt-face-p '(comint-highlight-prompt comint-highlight-prompt)))
+  (should-not (agent-shell--prompt-face-p 'default))
+  (should-not (agent-shell--prompt-face-p nil)))
+
+(ert-deftest agent-shell-prompt-ranges-test ()
+  "`agent-shell-prompt-ranges' finds typed, replayed, steered and live prompts."
+  (with-temp-buffer
+    (let ((marker (propertize "<shell-maker-end-of-prompt>"
+                              'invisible t 'shell-maker--marker t)))
+      ;; Typed at the shell.
+      (insert (propertize "Claude> " 'font-lock-face
+                          '(comint-highlight-prompt comint-highlight-prompt)
+                          'field 'output)
+              (propertize "typed" 'font-lock-face 'comint-highlight-input)
+              "\n" marker
+              ;; Quoted marker text without the property is not a boundary.
+              "reply <shell-maker-end-of-prompt>\n\n")
+      ;; Replayed by a restored session.
+      (insert (propertize "Claude> " 'font-lock-face
+                          '(agent-shell-prompt comint-highlight-prompt)
+                          'field 'output)
+              (propertize "replayed" 'font-lock-face 'agent-shell-input)
+              marker "\n\n")
+      ;; Steered into a running turn.
+      (insert (propertize "Claude> " 'font-lock-face 'agent-shell-prompt
+                          'field 'output)
+              (propertize "[steer] steered" 'font-lock-face 'agent-shell-input)
+              marker "\n\n")
+      ;; Live, still being typed into.
+      (insert (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt
+                          'field 'output)
+              "draft"))
+    (should (equal (seq-map (lambda (range)
+                              (list (buffer-substring-no-properties
+                                     (map-elt range :prompt-start)
+                                     (map-elt range :prompt-end))
+                                    (buffer-substring-no-properties
+                                     (map-elt range :input-start)
+                                     (map-elt range :input-end))))
+                            (agent-shell-prompt-ranges))
+                   '(("Claude> " "typed\n")
+                     ("Claude> " "replayed")
+                     ("Claude> " "[steer] steered")
+                     ("Claude> " "draft"))))))
+
+(ert-deftest agent-shell-prompt-ranges-field-test ()
+  "Only prompt-faced text ending an `output' field is a prompt.
+A response quoting a prompt in prompt face is not one."
+  (with-temp-buffer
+    (insert (propertize (concat "Quoting "
+                                (propertize "Claude> " 'font-lock-face
+                                            'comint-highlight-prompt)
+                                "in a reply\n")
+                        'field 'output)
+            (propertize "Claude> " 'font-lock-face 'comint-highlight-prompt
+                        'field 'output)
+            "draft")
+    (should (equal (seq-map (lambda (range)
+                              (list (buffer-substring-no-properties
+                                     (map-elt range :prompt-start)
+                                     (map-elt range :prompt-end))
+                                    (buffer-substring-no-properties
+                                     (map-elt range :input-start)
+                                     (map-elt range :input-end))))
+                            (agent-shell-prompt-ranges))
+                   '(("Claude> " "draft"))))))
 
 (ert-deftest agent-shell--live-input-prompt-p-narrowed-above-prompt-test ()
   "Guard against inverted `text-property-any' bounds while narrowed.
@@ -10140,6 +10463,84 @@ would ever render it."
                                      (buffer-substring-no-properties
                                       (point-min) (point-max))))))
       (delete-file image-file))))
+
+(ert-deftest agent-shell--render-deferred-markup-resets-undo-history-test ()
+  "Undo after a turn ending in a table undoes what was typed at the prompt.
+
+The table's last row has no newline, so it renders only at the end of
+the turn, re-laying out the table above the prompt.  Undo entries hold
+absolute positions, so the input typed in the meantime moves away from
+them.  Without a reset, undo would edit the table instead."
+  (should (equal
+           (agent-shell-tests--with-persistent-prompt-shell
+            (lambda ()
+              (buffer-enable-undo)
+              (let ((agent-shell-show-busy-indicator nil)
+                    (agent-shell-show-usage-at-turn-end nil)
+                    (on-success nil))
+                (cl-letf (((symbol-function 'agent-shell--send-request)
+                           (lambda (&rest args)
+                             (setq on-success (plist-get args :on-success))))
+                          ((symbol-function 'agent-shell--prompt-queue-process-next)
+                           #'ignore)
+                          ((symbol-function 'shell-maker--write-input-ring-history)
+                           #'ignore))
+                  (agent-shell--send-command :prompt "list the files"
+                                             :shell-buffer (current-buffer))
+                  (agent-shell--update-fragment
+                   :state agent-shell--state
+                   :block-id "agent-message"
+                   :body "| A |\n|---|\n| longer value |"
+                   :create-new t)
+                  (goto-char (point-max))
+                  (insert "draft")
+                  (undo-boundary)
+                  (funcall on-success '((stopReason . "end_turn")))
+                  ;; Stands in for the command loop, which boundaries the
+                  ;; undo list before running the undo command.
+                  (undo-boundary)
+                  (undo)
+                  (list (cons :prompt-input (agent-shell--prompt-input))
+                        (cons :table-intact (and (string-match-p
+                                                  "│ longer value │" (buffer-string))
+                                                 t)))))))
+           '((:prompt-input . nil) (:table-intact . t)))))
+
+(ert-deftest agent-shell--delete-fragment-resets-undo-history-test ()
+  "Undo after a fragment is deleted undoes what was typed at the prompt.
+
+Deleting a fragment above the prompt (a resolved permission request,
+say) pulls the input typed in the meantime up, away from the absolute
+positions its undo entries hold.  Without a reset, undo would edit the
+output above the prompt instead."
+  (should (equal
+           (agent-shell-tests--with-persistent-prompt-shell
+            (lambda ()
+              (buffer-enable-undo)
+              (agent-shell--update-fragment
+               :state agent-shell--state
+               :block-id "agent-message"
+               :body "Some agent output"
+               :create-new t)
+              (agent-shell--update-fragment
+               :state agent-shell--state
+               :block-id "permission"
+               :body "Allow this?"
+               :create-new t)
+              (goto-char (point-max))
+              (insert "draft")
+              (undo-boundary)
+              (agent-shell--delete-fragment :state agent-shell--state
+                                            :block-id "permission")
+              ;; Stands in for the command loop, which boundaries the
+              ;; undo list before running the undo command.
+              (undo-boundary)
+              (undo)
+              (list (cons :prompt-input (agent-shell--prompt-input))
+                    (cons :output-intact (and (string-match-p
+                                               "Some agent output" (buffer-string))
+                                              t)))))
+           '((:prompt-input . nil) (:output-intact . t)))))
 
 (ert-deftest agent-shell-file-display-action-test ()
   "Files open per `agent-shell-file-display-action\'.

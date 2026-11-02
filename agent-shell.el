@@ -4,17 +4,17 @@
 
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/agent-shell
-;; Version: 0.88.1
-;; Package-Requires: ((emacs "29.1") (shell-maker "0.97.5") (acp "0.17.1"))
+;; Version: 0.90.1
+;; Package-Requires: ((emacs "29.1") (shell-maker "0.98.2") (acp "0.17.1"))
 
-(defconst agent-shell--version "0.88.1")
+(defconst agent-shell--version "0.90.1")
 
 ;; Minimum dependency versions, as declared in the `Package-Requires'
 ;; header above.  Package managers that resolve versions enforce the
 ;; header on install; those that only resolve dependency names (straight.el,
 ;; for one) leave `agent-shell--start' as the sole check, so keep these two
 ;; in sync with it.
-(defconst agent-shell--shell-maker-minimum-version "0.97.5")
+(defconst agent-shell--shell-maker-minimum-version "0.98.2")
 
 (defconst agent-shell--acp-minimum-version "0.17.1")
 
@@ -500,7 +500,11 @@ bullet, while a body of prose is untouched."
                                (not (get-text-property
                                      (1- (point-max))
                                      'agent-shell-markdown-table-source))))))
-            (agent-shell--render-markdown :complete t)))))))
+            (agent-shell--render-markdown :complete t))))))
+  ;; Rendering can resize text above the prompt, shifting any unsubmitted
+  ;; input away from the undo entries recorded for it.
+  (when (agent-shell--live-input-prompt-p comint-last-prompt)
+    (agent-shell--reset-undo-history)))
 
 (defcustom agent-shell-confirm-interrupt t
   "Whether to prompt for confirmation before interrupting.
@@ -645,6 +649,10 @@ then dismisses the compose window, restoring the previous window layout.
 Prompts are sent without switching to watch the response."
   :type 'boolean
   :group 'agent-shell)
+;; `agent-shell-prompt-compose' sets this buffer-locally in the viewport,
+;; which transitions between major modes.  Make it permanent-local so
+;; transitioning does not reset it.
+(put 'agent-shell-viewport-dismiss-on-send 'permanent-local t)
 
 (defcustom agent-shell-embed-file-size-limit 102400
   "Maximum file size in bytes for embedding with ContentBlock::Resource.
@@ -811,6 +819,7 @@ Each element can be:
                                               session-meta
                                               mcp-servers
                                               notification-adapter
+                                              notification-handler
                                               icon-name
                                               install-instructions)
   "Create an agent configuration alist.
@@ -844,7 +853,11 @@ Keyword arguments:
 - MCP-SERVERS: Optional list of MCP servers for this agent, taking
   precedence over the global `agent-shell-mcp-servers'.  Same shape as
   that variable.
-- NOTIFICATION-ADAPTER: Optional function to modify/normalize `notification'
+- NOTIFICATION-ADAPTER: Optional function called with `:acp-notification'.
+  Return the original or a normalized notification for further handling.
+- NOTIFICATION-HANDLER: Optional function called after adaptation with an
+  alist of `:state' and `:acp-notification'.  Return non-nil if handled,
+  skipping core handling, or nil to let core handle it.
 - ICON-NAME: Name of the icon to use
 - INSTALL-INSTRUCTIONS: Instructions to show when executable is not found
 
@@ -864,6 +877,7 @@ Returns an alist with all specified values."
     (:session-meta . ,session-meta)
     (:mcp-servers . ,mcp-servers)
     (:notification-adapter . ,notification-adapter)            ;; function
+    (:notification-handler . ,notification-handler)            ;; function
     (:icon-name . ,icon-name)
     (:install-instructions . ,install-instructions)))
 
@@ -1870,7 +1884,8 @@ Returns nil if no icon should be displayed."
              ((image-supported-file-p icon-filename))
              (image (create-image icon-filename nil nil
                                   :ascent 'center
-                                  :height (frame-char-height))))
+                                  :height (frame-char-height)
+                                  :scale 1)))
     (with-temp-buffer
       (insert-image image)
       (buffer-string))))
@@ -3191,6 +3206,15 @@ For example, ((file_path . \"a.el\")) returns \"a.el\"."
             (seq-map (lambda (key) (map-elt raw-input key))
                      '(filepath fileName path file_path))))
 
+(defun agent-shell--raw-input-command (acp-raw-input)
+  "Return the command display string in ACP-RAW-INPUT, or nil.
+For example, ((command_line . \"ls -la\")) returns \"ls -la\"."
+  ;; Antigravity sends `command_line' rather than `command'.
+  ;; See https://github.com/xenodium/agent-shell/issues/903
+  (agent-shell--tool-call-command-to-string
+   (or (map-elt acp-raw-input 'command)
+       (map-elt acp-raw-input 'command_line))))
+
 (defun agent-shell--tool-call-file-paths (tool-call)
   "Return file paths reported by TOOL-CALL, or nil if unavailable.
 For example, two diffs for \"a.el\" return (\"a.el\" \"a.el\")."
@@ -3486,7 +3510,8 @@ Clears STATE's `:expanded-activity-group'."
               :file-path agent-shell--transcript-file)
              (agent-shell--emit-event
               :event 'agent-message-chunk
-              :data (list (cons :text-chunk (map-nested-elt acp-notification '(params update content text)))))
+              :data (list (cons :text-chunk (map-nested-elt acp-notification '(params update content text)))
+                          (cons :meta (map-nested-elt acp-notification '(params update _meta)))))
              (agent-shell--update-streamed-fragment
               :state state
               ;; Out of turn, key under a dedicated namespace so the
@@ -3518,8 +3543,8 @@ Clears STATE's `:expanded-activity-group'."
                                          (map-nested-elt acp-notification '(params update title)))))
                           (cons :status (map-nested-elt acp-notification '(params update status)))
                           (cons :kind (map-nested-elt acp-notification '(params update kind)))
-                          (cons :command (agent-shell--tool-call-command-to-string
-                                          (map-nested-elt acp-notification '(params update rawInput command))))
+                          (cons :command (agent-shell--raw-input-command
+                                          (map-nested-elt acp-notification '(params update rawInput))))
                           (cons :description (map-nested-elt acp-notification '(params update rawInput description)))
                           (cons :content (map-nested-elt acp-notification '(params update content)))
                           (cons :locations (map-nested-elt acp-notification '(params update locations)))
@@ -3531,7 +3556,8 @@ Clears STATE's `:expanded-activity-group'."
            (agent-shell--emit-event
             :event 'tool-call-update
             :data (list (cons :tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
-                        (cons :tool-call (map-nested-elt state (list :tool-calls (map-nested-elt acp-notification '(params update toolCallId)))))))
+                        (cons :tool-call (map-nested-elt state (list :tool-calls (map-nested-elt acp-notification '(params update toolCallId)))))
+                        (cons :meta (map-nested-elt acp-notification '(params update _meta)))))
            (let ((tool-call-labels (agent-shell-make-tool-call-label
                                     state (map-nested-elt acp-notification '(params update toolCallId))))
                  (group-id (agent-shell--activity-group-id
@@ -3720,8 +3746,8 @@ Clears STATE's `:expanded-activity-group'."
                     (when-let* ((description (agent-shell--tool-call-command-to-string
                                               (map-nested-elt acp-notification '(params update rawInput description)))))
                       (list (cons :description description)))
-                    (when-let* ((command (agent-shell--tool-call-command-to-string
-                                          (map-nested-elt acp-notification '(params update rawInput command)))))
+                    (when-let* ((command (agent-shell--raw-input-command
+                                          (map-nested-elt acp-notification '(params update rawInput)))))
                       (list (cons :command command)))
                     (when-let* ((raw-input (map-nested-elt acp-notification '(params update rawInput))))
                       (list (cons :raw-input raw-input)))
@@ -3753,7 +3779,8 @@ Clears STATE's `:expanded-activity-group'."
            (agent-shell--emit-event
             :event 'tool-call-update
             :data (list (cons :tool-call-id (map-nested-elt acp-notification '(params update toolCallId)))
-                        (cons :tool-call (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)))))))
+                        (cons :tool-call (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)))))
+                        (cons :meta (map-nested-elt acp-notification '(params update _meta)))))
            (let* ((diffs (map-nested-elt state `(:tool-calls ,(map-nested-elt acp-notification '(params update toolCallId)) :diffs)))
                   (output (concat
                            "\n\n"
@@ -3882,7 +3909,8 @@ Clears STATE's `:expanded-activity-group'."
            (agent-shell--update-header-and-mode-line)
            (agent-shell--emit-event
             :event 'config-option-update
-            :data (list (cons :config-options (agent-shell--config-options state))))
+            :data (list (cons :config-options (agent-shell--config-options state))
+                        (cons :meta (map-nested-elt acp-notification '(params update _meta)))))
            ;; Note: No need to set :last-entry-type as no text was inserted.
            nil)
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "usage_update")
@@ -3892,9 +3920,16 @@ Clears STATE's `:expanded-activity-group'."
             :acp-update (map-nested-elt acp-notification '(params update)))
            ;; Update header to reflect new context usage indicator
            (agent-shell--update-header-and-mode-line)
+           (agent-shell--emit-event
+            :event 'usage-update
+            :data (list (cons :usage (map-elt state :usage))
+                        (cons :meta (map-nested-elt acp-notification '(params update _meta)))))
            ;; Note: This is session-level state, no need to set :last-entry-type
            nil)
           ((equal (map-nested-elt acp-notification '(params update sessionUpdate)) "session_push_end")
+           ;; Before the turn ends, or a queued prompt dispatched by
+           ;; `on-finished' takes over the pending chunk's namespace.
+           (agent-shell--flush-stream-render state)
            (agent-shell-experimental--on-session-push-end
             :state state
             :on-finished (lambda ()
@@ -3989,7 +4024,8 @@ Clears STATE's `:expanded-activity-group'."
                  (agent-shell-jump-to-latest-permission-button-row)))
              (let ((data (list (cons :request-id (map-elt acp-request 'id))
                                (cons :tool-call-id tool-call-id)
-                               (cons :tool-call (map-nested-elt state (list :tool-calls tool-call-id))))))
+                               (cons :tool-call (map-nested-elt state (list :tool-calls tool-call-id)))
+                               (cons :meta (map-nested-elt acp-request '(params _meta))))))
                (agent-shell--emit-event
                 :event 'permission-request
                 :data data)
@@ -4153,7 +4189,8 @@ function before returning."
         (agent-shell--emit-event
          :event 'file-write
          :data (list (cons :path path)
-                     (cons :content content)))
+                     (cons :content content)
+                     (cons :meta (map-nested-elt acp-request '(params _meta)))))
         (acp-send-response
          :client (map-elt state :client)
          :response (acp-make-fs-write-text-file-response
@@ -5479,7 +5516,12 @@ variable (see makunbound)"))
                  (equal (current-buffer)
                         (map-elt state :buffer)))
       (error "Editing the wrong buffer: %s" (current-buffer)))
-    (agent-shell-ui-delete-fragment :namespace-id (map-elt state :request-count) :block-id block-id :no-undo t)))
+    (let ((input-start (agent-shell--prompt-input-start)))
+      (agent-shell-ui-delete-fragment :namespace-id (map-elt state :request-count) :block-id block-id :no-undo t)
+      ;; A deletion above the prompt pulled any unsubmitted input up, so the
+      ;; undo entries recorded for it point at the shifted text.
+      (unless (equal input-start (agent-shell--prompt-input-start))
+        (agent-shell--reset-undo-history)))))
 
 (cl-defun agent-shell--collapse-fragment-group (&key state namespace-id block-id)
   "Collapse group header BLOCK-ID under NAMESPACE-ID in STATE's buffers.
@@ -6727,7 +6769,7 @@ keeps entries fresh."
                                           (+ (agent-shell--svg-content-width svg) 16))))
              (let ((result (propertize
                             (format " %s" (with-temp-buffer
-                                            (svg-insert-image svg)
+                                            (insert-image (svg-image svg :scale 1))
                                             (buffer-string)))
                             'help-echo "Open settings menu"
                             'mouse-face 'mode-line-highlight
@@ -7049,15 +7091,23 @@ Initialization events (emitted in order):
                           initialization, see `agent-shell-initialized-p')
   `prompt-ready'        - Shell prompt displayed and ready for input
 
+Session events emitted for an ACP message also carry :meta in :data:
+that message's `_meta' as received, or nil.  It is agent-specific and
+not interpreted by the shell.  Like the rest of :data, it belongs to the
+triggering message only (for `tool-call-update', the latest update
+rather than the whole tool call).
+
 Session events:
   `tool-call-update'      - Tool call started or updated
-    :data contains :tool-call-id and :tool-call
+    :data contains :tool-call-id, :tool-call and :meta
   `config-option-update'  - ACP config option(s) changed
-    :data contains :config-options (normalized list)
+    :data contains :config-options (normalized list) and :meta
+  `usage-update'          - Agent reported context window or cost usage
+    :data contains :usage and :meta
   `file-write'            - File written via fs/write_text_file
-    :data contains :path and :content
+    :data contains :path, :content and :meta
   `permission-request'    - Permission prompt displayed to user
-    :data contains :request-id, :tool-call-id, :tool-call
+    :data contains :request-id, :tool-call-id, :tool-call and :meta
   `permission-response'   - Permission response sent
     :data contains :request-id, :tool-call-id, :option-id, :cancelled
   `elicitation-request'   - Elicitation form displayed to user
@@ -7072,11 +7122,11 @@ Session events:
     Secret answers in elicitation events are replaced with [redacted].
   `agent-message-chunk'   - Agent streamed a chunk of message text
     :data contains :text-chunk (the raw text the agent emitted, nil for a
-    non-text block such as an image).  Emitted once per streamed chunk, so
-    it may fire many times per turn; the shell neither renders nor
-    accumulates the text.
+    non-text block such as an image) and :meta.  Emitted once per streamed
+    chunk, so it may fire many times per turn; the shell neither renders
+    nor accumulates the text.
   `turn-complete'         - Agent turn finished and prompt ready for input
-    :data contains :stop-reason and :usage
+    :data contains :stop-reason, :usage and :meta
   `session-title-changed' - Session title updated
     :data contains :title
   `session-restored'      - Reloaded session fully replayed and settled
@@ -7108,6 +7158,17 @@ Example usage:
    :on-event (lambda (event)
                (let ((data (map-elt event :data)))
                  (message \"wrote: %s\" (map-elt data :path)))))
+
+  ;; Read usage and agent-specific `_meta' (Claude's rate limit)
+  (agent-shell-subscribe-to
+   :shell-buffer shell-buffer
+   :event \\='usage-update
+   :on-event
+     (lambda (event)
+       (message \"context: %s/%s rate limit: %S\"
+                (map-nested-elt event \\='(:data :usage :context-used))
+                (map-nested-elt event \\='(:data :usage :context-size))
+                (map-nested-elt event \\='(:data :meta _claude/rateLimit)))))
 
   ;; Unsubscribe
   (let ((token (agent-shell-subscribe-to
@@ -7484,7 +7545,8 @@ on error."
                  (agent-shell--emit-event
                   :event 'config-option-update
                   :data (list (cons :config-options
-                                    (agent-shell--config-options (agent-shell--state)))))
+                                    (agent-shell--config-options (agent-shell--state)))
+                              (cons :meta (map-elt acp-response '_meta))))
                  (when on-success
                    (funcall on-success)))
    :on-failure (or on-failure
@@ -8413,6 +8475,7 @@ pending-restore state once replay completes."
                 ;; A replay renders history the user never typed, so keep all of
                 ;; it out of undo history (see `agent-shell--reset-undo-history').
                 (let ((buffer-undo-list t)
+                      (shell-maker-inhibit-auto-scroll t)
                       (prompt-start (and comint-last-prompt
                                          (marker-position (car comint-last-prompt))
                                          (agent-shell--live-input-prompt-p comint-last-prompt)
@@ -8912,12 +8975,18 @@ The agent config's `:mcp-servers' take precedence over the global
      :client (map-elt state :client)
      :on-notification (lambda (acp-notification)
                         (when (eq client (map-elt state :client))
-                          (agent-shell--on-notification
-                           :state state
-                           :acp-notification
-                           (agent-shell--adapt-notification
-                            :state state
-                            :acp-notification acp-notification)))))
+                          (let ((adapted-notification
+                                 (agent-shell--adapt-notification
+                                  :state state
+                                  :acp-notification acp-notification)))
+                            (if-let* ((handler (map-nested-elt state '(:agent-config :notification-handler)))
+                                      ((functionp handler))
+                                      ((funcall handler `((:state . ,state)
+                                                          (:acp-notification . ,adapted-notification)))))
+                                (map-put! state :last-activity-time (current-time))
+                              (agent-shell--on-notification
+                               :state state
+                               :acp-notification adapted-notification))))))
     (acp-subscribe-to-requests
      :client (map-elt state :client)
      :on-request (lambda (acp-request)
@@ -9461,7 +9530,8 @@ reads the buffer's prompt capabilities."
                      (agent-shell--finish-output :config shell-maker--config
                                                 :success t)
                      (let ((data (list (cons :stop-reason (map-elt acp-response 'stopReason))
-                                       (cons :usage (map-elt (agent-shell--state) :usage)))))
+                                       (cons :usage (map-elt (agent-shell--state) :usage))
+                                       (cons :meta (map-elt acp-response '_meta)))))
                        (agent-shell--emit-event
                         :event 'turn-complete
                         :data data)
@@ -10044,8 +10114,7 @@ For example:
   => \"```console\\nls -la\\n```\""
   (let* ((title (map-elt tool-call :title))
          (raw-input (map-elt tool-call :raw-input))
-         (command (agent-shell--tool-call-command-to-string
-                   (map-elt raw-input 'command)))
+         (command (agent-shell--raw-input-command raw-input))
          (filepath (agent-shell--raw-input-file-path raw-input))
          ;; Fetch tools (eg. OpenCode's webfetch) put the target URL
          ;; under `url'.  Surface it in full below, since the basename
@@ -10832,31 +10901,33 @@ Uses AGENT-CWD to shorten file paths where necessary."
                      (unless no-error
                        (user-error "No region selected"))))
          (processed-text (if (map-elt region :file)
-                             (let ((file-link (agent-shell--make-file-link
-                                               :label (format "%s:%d-%d"
-                                                              (if (and agent-cwd (file-in-directory-p (map-elt region :file) agent-cwd))
-                                                                  (file-relative-name (map-elt region :file) agent-cwd)
-                                                                (map-elt region :file))
-                                                              (map-elt region :line-start)
-                                                              (map-elt region :line-end))
-                                               :file (map-elt region :file)
-                                               :line-start (map-elt region :line-start)
-                                               :line-end (map-elt region :line-end)
-                                               :hint "open file"))
-                                   (numbered-preview
-                                    (when-let* ((buffer (get-file-buffer (map-elt region :file))))
-                                      (let ((char-start (map-elt region :char-start))
-                                            (char-end (map-elt region :char-end))
-                                            (max-preview-lines 5))
-                                        (if (= (count-lines char-start char-end) 1)
-                                            ;; Same line region? Avoid numbering.
-                                            (agent-shell--buffer-substring-with-faces
-                                             char-start char-end)
-                                          (agent-shell--get-numbered-region
-                                           :buffer buffer
-                                           :from char-start
-                                           :to char-end
-                                           :cap max-preview-lines))))))
+                             (let* ((line-start (map-elt region :line-start))
+                                    (line-end (map-elt region :line-end))
+                                    (file-path (if (and agent-cwd (file-in-directory-p (map-elt region :file) agent-cwd))
+                                                   (file-relative-name (map-elt region :file) agent-cwd)
+                                                 (map-elt region :file)))
+                                    (file-link (agent-shell--make-file-link
+                                                :label (if (= line-start line-end)
+                                                           (format "%s:%d" file-path line-start)
+                                                         (format "%s:%d-%d" file-path line-start line-end))
+                                                :file (map-elt region :file)
+                                                :line-start line-start
+                                                :line-end line-end
+                                                :hint "open file"))
+                                    (numbered-preview
+                                     (when-let* ((buffer (get-file-buffer (map-elt region :file))))
+                                       (let ((char-start (map-elt region :char-start))
+                                             (char-end (map-elt region :char-end))
+                                             (max-preview-lines 5))
+                                         (if (= (count-lines char-start char-end) 1)
+                                             ;; Same line region? Avoid numbering.
+                                             (agent-shell--buffer-substring-with-faces
+                                              char-start char-end)
+                                           (agent-shell--get-numbered-region
+                                            :buffer buffer
+                                            :from char-start
+                                            :to char-end
+                                            :cap max-preview-lines))))))
                                (if numbered-preview
                                    (concat file-link "\n\n" numbered-preview)
                                  file-link))
@@ -11803,22 +11874,24 @@ For example:
 (defun agent-shell--make-transcript-frontmatter (fields)
   "Return FIELDS rendered as a YAML frontmatter block.
 
-FIELDS is an alist mapping string keys to string values.  Values are
-emitted as double-quoted YAML scalars.  Fields with nil values are
-skipped, so optional fields can be passed as is.
+FIELDS is an alist mapping string keys to string or Lisp time values.
+Strings are emitted as double-quoted YAML scalars.  Times are emitted
+unquoted in ISO 8601, so YAML reads them as timestamps.  Fields with
+nil values are skipped, so optional fields can be passed as is.
 
 For example:
 
   (agent-shell--make-transcript-frontmatter
-   \='((\"agent\" . \"Claude\")
+   \=`((\"agent\" . \"Claude\")
+     (\"started\" . ,(current-time))
      (\"model\" . nil)))
 
 returns:
 
   ---
   agent: \"Claude\"
-  ---
-"
+  started: 2025-11-02T18:17:41-05:00
+  ---"
   (format "---
 %s
 ---
@@ -11826,7 +11899,10 @@ returns:
 "
           (string-join
            (map-apply (lambda (key value)
-                        (format "%s: %s" key (json-encode-string value)))
+                        (format "%s: %s" key
+                                (if (stringp value)
+                                    (json-encode-string value)
+                                  (format-time-string "%FT%T%:z" value))))
                       (map-filter (lambda (_key value) value) fields))
            "\n")))
 
@@ -11851,7 +11927,7 @@ disable the transcript for this shell and return nil."
                       (list (cons "agent" (or (map-nested-elt agent-shell--state '(:agent-config :mode-line-name))
                                               (map-nested-elt agent-shell--state '(:agent-config :buffer-name))
                                               "Unknown Agent"))
-                            (cons "started" (format-time-string "%FT%T%:z"))
+                            (cons "started" (current-time))
                             (cons "working_directory" (agent-shell-cwd))
                             (cons "session_id" (map-nested-elt agent-shell--state '(:session :id)))
                             (cons "model" (map-nested-elt agent-shell--state '(:session :model-id)))))

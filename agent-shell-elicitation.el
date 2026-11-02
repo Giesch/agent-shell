@@ -1198,6 +1198,8 @@ DISCONNECTED retires an old connection without sending a response."
                 (when (agent-shell--elicitation-current state request-id client token)
                   (let ((data (list (cons :request-id request-id)
                                     (cons :tool-call-id (map-elt record :tool-call-id))
+                                    (cons :message (map-elt record :message))
+                                    (cons :meta (map-nested-elt acp-request '(params _meta)))
                                     (cons :fields (copy-tree (map-elt record :fields) t)))))
                     (agent-shell--emit-event :event 'elicitation-request :data data)
                     (when (agent-shell--elicitation-current state request-id client token)

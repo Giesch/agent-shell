@@ -5,6 +5,50 @@
 
 ;;; Code:
 
+(ert-deftest agent-shell-ui-create-new-fragment-preserves-existing-test ()
+  "Creating a fragment with a reused ID preserves the earlier fragment."
+  (with-temp-buffer
+    (dolist (body '("first" "second"))
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model :block-id "same" :body body)
+       :create-new t))
+    (should (string-match-p "first" (buffer-string)))
+    (should (string-match-p "second" (buffer-string)))))
+
+(ert-deftest agent-shell-ui-create-new-text-preserves-existing-test ()
+  "Creating text with a reused ID leaves the earlier entry intact."
+  (with-temp-buffer
+    (dolist (text '("first" "second"))
+      (agent-shell-ui-update-text :block-id "same" :text text :create-new t))
+    (agent-shell-ui-update-text :block-id "same" :text "third")
+    (should (string-match-p "first\n\nthird\\'" (buffer-string)))
+    (should-not (string-match-p "second" (buffer-string)))))
+
+(ert-deftest agent-shell-ui-create-new-skips-existing-entry-search-test ()
+  "Creating a new entry never searches the buffer for an existing one.
+The search walks back over every block, so replaying a large session
+pays for it on each insertion (see PR #897)."
+  (with-temp-buffer
+    (agent-shell-ui-update-text :block-id "same" :text "first")
+    (cl-letf* ((search (symbol-function 'text-property-search-backward))
+               ((symbol-function 'text-property-search-backward)
+                (lambda (property &optional value predicate not-current)
+                  ;; Only the existing-entry search passes a nil VALUE.
+                  ;; Measuring the newly inserted block searches too, but
+                  ;; by its qualified id.
+                  (when (and (eq property 'agent-shell-ui-state)
+                             (not value)
+                             (functionp predicate))
+                    (error "Unexpected search for an existing entry"))
+                  (funcall search property value predicate not-current))))
+      (agent-shell-ui-update-text :block-id "same" :text "second" :create-new t)
+      (agent-shell-ui-update-fragment
+       (agent-shell-ui-make-fragment-model :block-id "same" :body "third")
+       :create-new t))
+    (should (string-match-p "first" (buffer-string)))
+    (should (string-match-p "second" (buffer-string)))
+    (should (string-match-p "third" (buffer-string)))))
+
 (ert-deftest agent-shell-ui-body-invisible-p-handles-whitespace-only-body ()
   ;; Regression for PR #597 (pi-acp): the markdown renderer strips
   ;; an empty `\\`\\`\\`console' fence down to a body of only
@@ -756,11 +800,15 @@ caller stamping ranges leaves it unmarked, stranding navigation there)."
                                           :from (map-elt c :start) :to (map-elt c :end))
                                          :start))))
       ;; Collapse: both child header lines hidden.
-      (let ((inhibit-read-only t)) (agent-shell-ui--set-group-collapsed "ns-grp" t))
+      (let ((inhibit-read-only t))
+        (agent-shell-ui--set-group-collapsed
+         :group-qualified-id "ns-grp" :collapsed t))
       (should (get-text-property (child-start 0) 'invisible))
       (should (get-text-property (child-start 1) 'invisible))
       ;; Expand: headers visible; m1 body stays hidden, m2 body visible.
-      (let ((inhibit-read-only t)) (agent-shell-ui--set-group-collapsed "ns-grp" nil))
+      (let ((inhibit-read-only t))
+        (agent-shell-ui--set-group-collapsed
+         :group-qualified-id "ns-grp" :collapsed nil))
       (should-not (get-text-property (child-start 0) 'invisible))
       (should-not (get-text-property (child-start 1) 'invisible))
       (should (get-text-property (body-start 0) 'invisible))
@@ -803,6 +851,67 @@ caller stamping ranges leaves it unmarked, stranding navigation there)."
       (agent-shell-ui-set-group-collapsed-by-id
        :namespace-id "ns" :block-id "leaf" :collapsed t)
       (should-not (child-hidden-p)))))
+
+(defun agent-shell-ui-tests--insert-mixed-group ()
+  "Insert group \"ns-grp\" with child m1 collapsed and child m2 expanded."
+  (agent-shell-ui-mode 1)
+  (agent-shell-ui-update-fragment
+   (agent-shell-ui-make-fragment-model
+    :namespace-id "ns" :block-id "m1" :group-id "grp" :group-label "T"
+    :label-left "run" :label-right "a" :body "aa")
+   :navigation 'always)
+  (agent-shell-ui-update-fragment
+   (agent-shell-ui-make-fragment-model
+    :namespace-id "ns" :block-id "m2" :group-id "grp" :group-label "T"
+    :label-left "run" :label-right "b" :body "bb")
+   :expanded t :navigation 'always))
+
+(ert-deftest agent-shell-ui-toggle-fragment-recursive-from-child-test ()
+  "A prefix on a child folds its group and every child with it.
+Collapsing recursively also closes the children, so a plain re-expand
+of the group shows them all collapsed."
+  (with-temp-buffer
+    (agent-shell-ui-tests--insert-mixed-group)
+    (goto-char (agent-shell-ui-tests--fragment-start "ns-m1"))
+    (agent-shell-ui-toggle-fragment '(4))
+    (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "grp"))
+    (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "m1"))
+    (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "m2"))
+    ;; Point was hidden by the collapse, so it lands on the group header.
+    (should (= (point) (agent-shell-ui-tests--fragment-start "ns-grp")))
+    (agent-shell-ui-toggle-fragment)
+    (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "grp"))
+    (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "m1"))
+    (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "m2"))))
+
+(ert-deftest agent-shell-ui-toggle-fragment-recursive-from-header-test ()
+  "A prefix on a collapsed group's header expands the group and every child."
+  (with-temp-buffer
+    (agent-shell-ui-tests--insert-mixed-group)
+    (goto-char (agent-shell-ui-tests--fragment-start "ns-grp"))
+    (agent-shell-ui-toggle-fragment)
+    (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "grp"))
+    (agent-shell-ui-toggle-fragment '(4))
+    (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "grp"))
+    (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "m1"))
+    (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "m2"))
+    (should-not (get-text-property
+                 (agent-shell-ui-tests--fragment-start "ns-m1") 'invisible))))
+
+(ert-deftest agent-shell-ui-toggle-fragment-recursive-outside-group-test ()
+  "A prefix on a fragment outside any group toggles just that fragment."
+  (with-temp-buffer
+    (agent-shell-ui-tests--insert-mixed-group)
+    (agent-shell-ui-update-fragment
+     (agent-shell-ui-make-fragment-model
+      :namespace-id "ns" :block-id "leaf" :label-left "msg" :body "cc")
+     :expanded t :navigation 'always)
+    (goto-char (agent-shell-ui-tests--fragment-start "ns-leaf"))
+    (agent-shell-ui-toggle-fragment '(4))
+    (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "leaf"))
+    (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "grp"))
+    (should (agent-shell-ui-tests--fragment-collapsed-p "ns" "m1"))
+    (should-not (agent-shell-ui-tests--fragment-collapsed-p "ns" "m2"))))
 
 (ert-deftest agent-shell-ui-group-child-streams-body-stays-nested-test ()
   "A labels-only child that later gains a body stays nested and indented."
@@ -866,7 +975,9 @@ child stays in its original group."
       :namespace-id "ns" :block-id "m1" :group-id "grp" :group-label "T"
       :label-left "run" :label-right "a")
      :navigation 'always)
-    (let ((inhibit-read-only t)) (agent-shell-ui--set-group-collapsed "ns-grp" t))
+    (let ((inhibit-read-only t))
+      (agent-shell-ui--set-group-collapsed
+       :group-qualified-id "ns-grp" :collapsed t))
     (agent-shell-ui-update-fragment
      (agent-shell-ui-make-fragment-model
       :namespace-id "ns" :block-id "m2" :group-id "grp" :group-label "T"
@@ -1059,7 +1170,9 @@ would put it."
       ;; Expanded: header and both children are visited.
       (should (equal '("d-before" "d-g" "d-m1" "d-m2" "d-after") (walk)))
       ;; Collapsed: children are skipped.
-      (let ((inhibit-read-only t)) (agent-shell-ui--set-group-collapsed "d-g" t))
+      (let ((inhibit-read-only t))
+        (agent-shell-ui--set-group-collapsed
+         :group-qualified-id "d-g" :collapsed t))
       (should (equal '("d-before" "d-g" "d-after") (walk))))))
 
 (ert-deftest agent-shell-ui-group-delete-child-keeps-header-test ()

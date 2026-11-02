@@ -17,7 +17,7 @@
 (defconst agent-shell-tests--root
   (expand-file-name ".." (file-name-directory (or load-file-name buffer-file-name))))
 
-(defconst agent-shell-tests--parent-revisions '("dc4764c" "80887a9")
+(defconst agent-shell-tests--parent-revisions '("ebcb74e390cb4e23cf5095fc01fffc06e8125c9a" "5f3a8525c979ff92de0de951c9bf41e681c6b2c5")
   "Fork and pinned upstream revisions whose tests must be retained.")
 
 (defconst agent-shell-tests--required-tests
@@ -26,12 +26,21 @@
   "Tests which must be selected, completed, and not skipped.")
 
 (defvar agent-shell-tests--superseded-tests
-  '((agent-shell-chat-label-is-before-string-test
+  '((agent-shell-chat-prompt-face-p-test
+     agent-shell--prompt-face-p-test
+     "Checks prompt-face recognition through the shared core helper.")
+    (agent-shell-chat-prompt-runs-test
+     agent-shell-prompt-ranges-test
+     "Checks ordered prompt boundaries through the shared range API used by chat rendering.")
+    (agent-shell-markdown-link-hints-where-it-lands
+     agent-shell-markdown-link-hints-its-target
+     "Checks link hints naming their destination with the updated target wording.")
+    (agent-shell-markdown-link-help-echo-says-where-it-lands
+     agent-shell-markdown-link-help-echo-names-its-target
+     "Checks help-echo destination text with the updated target wording.")
+    (agent-shell-chat-label-is-before-string-test
      agent-shell-chat-label-below-content-renders-once-test
-     "Checks one heading below its content with both position-backed rows and fallback strings; the old assertion required before-string storage.")
-    (agent-shell--render-deferred-images-test
-     agent-shell--render-deferred-markup-test
-     "Retains deferred image rendering, collapsed-image invisibility, and exclusion of non-body regions, and extends completion coverage to lists, blockquotes, and headings."))
+     "Checks one heading below its content with both position-backed rows and fallback strings; the old assertion required before-string storage."))
   "Explicit coverage mappings: (OLD NEW REASON).
 NEW must be a candidate test and REASON must explain the equivalent coverage.
 Do not use this to waive missing coverage.")

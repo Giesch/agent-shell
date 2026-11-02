@@ -444,8 +444,8 @@ streaming **not bold**" nil)))))
 `get-pos-property' reports what text inserted at a position would
 inherit rather than what sits there.  Unless the span is
 rear-nonsticky the hint still answers one position past its end, so a
-link's \"Press RET to open in browser\" shows while point sits on the
-space after the link."
+link's \"Press RET to open: ...\" shows while point sits on the space
+after the link."
   (with-temp-buffer
     (insert "see [wool.com](https://wool.com/x) ok\n\n"
             "| A | L |\n|---|---|\n| x | [j.com](https://j.com/y) |\n\n"
@@ -679,8 +679,7 @@ it is still picked up by the bare-URL linkifier."
       (delete-file image-file))))
 
 (ert-deftest agent-shell-markdown-remote-image-link-hints-open-key ()
-  ;; A remote image that falls back to a link hints at the browser rather
-  ;; than at opening a file, since that's what invoking it does.
+  ;; A remote image that falls back to a link hints like any other link.
   (let ((rendered (agent-shell-markdown-convert
                    "![docs](https://example.com/a.png)"))
         (echoed nil))
@@ -689,60 +688,46 @@ it is still picked up by the bare-URL linkifier."
                  (setq echoed (apply #'format format-string args)))))
       (funcall (seq-first (get-text-property 0 'cursor-sensor-functions rendered))
                nil nil 'entered)
-      (should (equal "Press RET to open image in browser" echoed)))))
+      (should (equal "Press RET to open: https://example.com/a.png"
+                     echoed)))))
 
-(ert-deftest agent-shell-markdown-link-hints-where-it-lands ()
-  ;; A link looks actionable (link face), but not where invoking it goes: `agent-shell-markdown--open-link' visits local
-  ;; files in Emacs and sends everything else to the browser.  The hint
-  ;; names that, and is computed on entry so a file appearing or going
-  ;; away later doesn't leave it lying.
-  (let ((linked-file (make-temp-file "agent-shell-test" nil ".el"))
-        (echoed nil))
-    (unwind-protect
-        (cl-letf (((symbol-function 'message)
-                   (lambda (format-string &rest args)
-                     (setq echoed (apply #'format format-string args)))))
-          (let ((rendered (agent-shell-markdown-convert
-                           (format "[code](%s)" linked-file))))
-            (funcall (seq-first (get-text-property
-                                 0 'cursor-sensor-functions rendered))
-                     nil nil 'entered)
-            (should (equal "Press RET to open file" echoed)))
-          (let ((rendered (agent-shell-markdown-convert
-                           "[docs](https://example.com)")))
-            (funcall (seq-first (get-text-property
-                                 0 'cursor-sensor-functions rendered))
-                     nil nil 'entered)
-            (should (equal "Press RET to open in browser" echoed))))
-      (delete-file linked-file))))
+(ert-deftest agent-shell-markdown-link-hints-its-target ()
+  ;; A link's text needn't match where it goes, so the hint names the
+  ;; target in full, letting it be inspected before opening.
+  (let ((echoed nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq echoed (apply #'format format-string args)))))
+      (let ((rendered (agent-shell-markdown-convert
+                       "[code](/tmp/notes.org#L10)")))
+        (funcall (seq-first (get-text-property
+                             0 'cursor-sensor-functions rendered))
+                 nil nil 'entered)
+        (should (equal "Press RET to open: /tmp/notes.org#L10" echoed)))
+      (let ((rendered (agent-shell-markdown-convert
+                       "[docs](https://example.com)")))
+        (funcall (seq-first (get-text-property
+                             0 'cursor-sensor-functions rendered))
+                 nil nil 'entered)
+        (should (equal "Press RET to open: https://example.com" echoed))))))
 
-(ert-deftest agent-shell-markdown-link-help-echo-says-where-it-lands ()
+(ert-deftest agent-shell-markdown-link-help-echo-names-its-target ()
   ;; The mouse gets the same wording the echo area does, minus the key
   ;; (a tooltip naming one is no use to whoever is holding a mouse).
-  ;; `help-echo' is a function, so it resolves on hover like the hint.
-  (let ((linked-file (make-temp-file "agent-shell-test" nil ".el")))
-    (unwind-protect
-        (progn
-          (should (equal "Open file"
-                         (funcall (get-text-property
-                                   0 'help-echo
-                                   (agent-shell-markdown-convert
-                                    (format "[code](%s)" linked-file)))
-                                  nil nil 0)))
-          (should (equal "Open in browser"
-                         (funcall (get-text-property
-                                   0 'help-echo
-                                   (agent-shell-markdown-convert
-                                    "[docs](https://example.com)"))
-                                  nil nil 0)))
-          ;; A remote image falling back to a link keeps its own wording.
-          (should (equal "Open image in browser"
-                         (funcall (get-text-property
-                                   0 'help-echo
-                                   (agent-shell-markdown-convert
-                                    "![docs](https://example.com/a.png)"))
-                                  nil nil 0))))
-      (delete-file linked-file))))
+  (should (equal "Open: /tmp/notes.org#L10"
+                 (get-text-property
+                  0 'help-echo
+                  (agent-shell-markdown-convert "[code](/tmp/notes.org#L10)"))))
+  (should (equal "Open: https://example.com"
+                 (get-text-property
+                  0 'help-echo
+                  (agent-shell-markdown-convert "[docs](https://example.com)"))))
+  ;; So does a remote image falling back to a link.
+  (should (equal "Open: https://example.com/a.png"
+                 (get-text-property
+                  0 'help-echo
+                  (agent-shell-markdown-convert
+                   "![docs](https://example.com/a.png)")))))
 
 (ert-deftest agent-shell-markdown-image-help-echo-names-the-action ()
   ;; Images say the same to the mouse, leaving resizing out since it has
@@ -2089,6 +2074,23 @@ print(\"hi\")
       (should-not highlighted-mode-hook-ran)
       (should observer-hook-ran))))
 
+(ert-deftest agent-shell-markdown-source-block-fontifies-last-diff-line ()
+  "A diff block's last line gets diff faces like the lines before it."
+  (let ((rendered (agent-shell-markdown-convert "```diff
++ first
++ last
+```")))
+    (dolist (line '("+ first" "+ last"))
+      (let ((pos (string-search line rendered)))
+        (should (memq 'diff-indicator-added
+                      (ensure-list (get-text-property pos 'face rendered))))
+        (should (memq 'diff-added
+                      (ensure-list (get-text-property (+ pos 2) 'face rendered))))))))
+
+(ert-deftest agent-shell-markdown-highlight-code-keeps-code-length ()
+  "Highlighting returns exactly CODE's characters, with no added newline."
+  (should (equal (agent-shell-markdown--highlight-code "+ a" "diff") "+ a")))
+
 (ert-deftest agent-shell-markdown-convert-source-block-body-tagged ()
   ;; Body chars carry `agent-shell-markdown-frozen t' so subsequent calls
   ;; treat them as an avoid-range (streaming-safe).  Rendered output
@@ -2823,7 +2825,7 @@ after" nil)))))
         (funcall (seq-first (get-text-property
                              link-start 'cursor-sensor-functions rendered))
                  nil nil 'entered)
-        (should (equal "Press RET to open in browser" echoed))))))
+        (should (equal "Press RET to open: https://example.com" echoed))))))
 
 (ert-deftest agent-shell-markdown-convert-table-skips-frozen-cell-pipe ()
   ;; `| `a|b` | c |' — inline-code body contains a `|', which our
@@ -4613,6 +4615,59 @@ exercised by the editing in the -all-math-cases test.)"
                            (match-beginning 0))))
         (agent-shell-markdown-replace-markup)
         (should (= (agent-shell-markdown--watermark-start) open-dollar))))))
+
+(ert-deftest agent-shell-markdown-render-functions-protect-pending-markup-test ()
+  "The earliest external frontier protects unfinished markup this pass."
+  (with-temp-buffer
+    (let* ((prefix "intro\n")
+           (pending "$$\n**pending** and \\_literal\\_\nmore\n")
+           (frontier (+ (point-min) (length prefix)))
+           (agent-shell-markdown-render-functions
+            (list (lambda (_context)
+                    (list (cons :watermark (+ frontier 4))))
+                  #'ignore
+                  (lambda (_context)
+                    (list (cons :watermark frontier))))))
+      (insert prefix pending)
+      (agent-shell-markdown-replace-markup :render-images nil)
+      ;; Neither emphasis nor escape decoding may consume pending input.
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     (concat prefix pending)))
+      (should (= (agent-shell-markdown--watermark-start) frontier))
+      ;; Once the external renderer releases its frontier, revisit the tail.
+      (let ((agent-shell-markdown-render-functions nil))
+        (agent-shell-markdown-replace-markup :render-images nil))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "intro\n$$\npending and _literal_\nmore\n")))))
+
+(ert-deftest agent-shell-markdown-render-functions-watermark-before-narrow-test ()
+  "An external frontier behind the watermark leaves earlier text alone."
+  (with-temp-buffer
+    (insert "**behind**\n**tail**\n")
+    ;; Stamp the watermark past `**behind**' so this pass starts at `**tail**'.
+    (put-text-property (point-min) (1+ (point-min))
+                       'agent-shell-markdown-watermark 11)
+    (let ((agent-shell-markdown-render-functions
+           (list (lambda (_context)
+                   (list (cons :watermark 1))))))
+      (agent-shell-markdown-replace-markup :render-images nil))
+    (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                   "**behind**\n**tail**\n"))))
+
+(ert-deftest agent-shell-markdown-fontification-bookkeeping-is-silent-test ()
+  "Fontification properties do not fire change hooks or dirty the buffer."
+  (dolist (modified '(nil t))
+    (with-temp-buffer
+      (insert (propertize "plain text" 'face 'bold))
+      (set-buffer-modified-p modified)
+      (let* ((changes 0)
+             (after-change-functions
+              (list (lambda (&rest _) (setq changes (1+ changes))))))
+        (agent-shell-markdown-replace-markup :render-images nil)
+        (should (= changes 0))
+        (should (eq (buffer-modified-p) modified))
+        (should (eq (get-text-property (point-min) 'font-lock-face) 'bold))
+        (should (eq (get-text-property (point-min) 'fontified) t))))))
 
 (ert-deftest agent-shell-markdown-render-functions-all-math-cases ()
   ;; A renderer that claims every math form the PR supports and wraps its

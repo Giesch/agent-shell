@@ -154,9 +154,15 @@ label reporting itself more than once shows up as a repeat."
     (nreverse found)))
 
 (defun agent-shell-chat-mode-tests--prompt (text)
-  "Insert a shell prompt run displaying TEXT, as shell-maker fontifies it."
+  "Insert a shell prompt run displaying TEXT, as shell-maker fontifies it.
+The prompt's field properties are rear-nonsticky, as shell-maker's
+output filter leaves them, so input typed after it is outside the field."
   (insert (propertize text 'font-lock-face
-                      '(comint-highlight-prompt comint-highlight-prompt))))
+                      '(comint-highlight-prompt comint-highlight-prompt)
+                      'field 'output
+                      'inhibit-line-move-field-capture t
+                      'rear-nonsticky
+                      '(field inhibit-line-move-field-capture read-only font-lock-face))))
 
 (defun agent-shell-chat-mode-tests--marker ()
   "Insert the invisible `<shell-maker-end-of-prompt>' marker.
@@ -249,13 +255,6 @@ without an `agent-shell-chat--tag' are left alone."
     (should (equal (substring-no-properties
                     (agent-shell-chat--displayed-substring (point-min) (point-max)))
                    "Claude> hi"))))
-
-(ert-deftest agent-shell-chat-prompt-face-p-test ()
-  "Prompt runs are recognized whether the face is a symbol or a list."
-  (should (agent-shell-chat--prompt-face-p 'comint-highlight-prompt))
-  (should (agent-shell-chat--prompt-face-p '(comint-highlight-prompt comint-highlight-prompt)))
-  (should-not (agent-shell-chat--prompt-face-p 'default))
-  (should-not (agent-shell-chat--prompt-face-p nil)))
 
 (ert-deftest agent-shell-chat-agent-name-test ()
   "The agent label uses `:mode-line-name', falling back to \"Agent\"."
@@ -1372,6 +1371,7 @@ position keeps every one reachable.
 Needs a real window to scroll, so it is skipped in batch."
   (skip-unless (not noninteractive))
   (agent-shell-chat-mode-tests--with-shell
+    (setq-local agent-shell-chat-mode t)
     (dotimes (i 40)
       (agent-shell-chat-mode-tests--prompt "Claude> ")
       (insert (format "question %d\n" i))
@@ -1383,15 +1383,58 @@ Needs a real window to scroll, so it is skipped in batch."
       (goto-char (point-min))
       (set-window-start window (point-min))
       (redisplay t)
-      (let ((last -1) (stalled nil) (n 0))
+      (let ((stalled nil) (n 0))
         (while (and (< n 400) (not stalled)
                     (not (pos-visible-in-window-p (point-max) window)))
-          (ignore-errors (scroll-up-command 1))
-          (redisplay t)
-          (when (= (window-start window) last)
-            (setq stalled (line-number-at-pos (window-start window))))
-          (setq last (window-start window) n (1+ n)))
-        (should-not stalled)))))
+          (let ((start (window-start window))
+                (vscroll (window-vscroll window t)))
+            (ignore-errors (scroll-up-command 1))
+            (redisplay t)
+            (when (and (= start (window-start window))
+                       (= vscroll (window-vscroll window t))
+                       (not (pos-visible-in-window-p (point-max) window)))
+              (setq stalled (line-number-at-pos start))))
+          (setq n (1+ n)))
+        (should-not stalled)
+        (should (pos-visible-in-window-p (point-max) window))))))
+
+(ert-deftest agent-shell-chat-scroll-recovers-after-adjacent-header-test ()
+  "Recover when a one-line scroll stops at the end of a multiline header."
+  (save-window-excursion
+    (with-temp-buffer
+      (setq-local agent-shell-chat-mode t)
+      (insert "header\ninput\n")
+      (let* ((position (save-excursion
+                         (goto-char (point-min))
+                         (search-forward "input")
+                         (match-beginning 0)))
+             (header (make-overlay (point-min) position))
+             (input (make-overlay position (point-max)))
+             (window (selected-window))
+             calls)
+        (overlay-put header 'agent-shell-chat--tag 'me)
+        (overlay-put header 'before-string "Me\n\n")
+        (overlay-put input 'agent-shell-chat--tag 'me-input)
+        (dotimes (_ 60) (insert "more text\n"))
+        (set-window-buffer window (current-buffer))
+        (set-window-point window position)
+        (set-window-start window position t)
+        (redisplay t)
+        (should (= (window-start window) position))
+        (agent-shell-chat--scroll-up-advice
+         (lambda (count)
+           (push count calls)
+           (when (> count 1)
+             (set-window-start window (1+ position) t)))
+         1)
+        (should (equal (nreverse calls) '(1 3)))
+        (should (> (window-start window) position))
+        (setq calls nil)
+        (set-window-start window position t)
+        (overlay-put header 'before-string "Me")
+        (agent-shell-chat--scroll-up-advice
+         (lambda (count) (push count calls)) 1)
+        (should (equal calls '(1)))))))
 
 (ert-deftest agent-shell-chat-empty-submission-hidden-test ()
   "An empty submission (a prompt with another below it) is not labeled.
@@ -1482,18 +1525,6 @@ The overlay starts past the `:extend' background and drops its `line-prefix'."
   (should (agent-shell-chat--extends-bg-p '(agent-shell-chat-mode-tests--panel)))
   (should-not (agent-shell-chat--extends-bg-p 'agent-shell-chat-mode-tests--plain))
   (should-not (agent-shell-chat--extends-bg-p nil)))
-
-(ert-deftest agent-shell-chat-prompt-runs-test ()
-  "`agent-shell-chat--prompt-runs' collects each prompt run in buffer order."
-  (agent-shell-chat-mode-tests--with-shell
-    (agent-shell-chat-mode-tests--prompt "Claude> ")
-    (insert "hello\n")
-    (agent-shell-chat-mode-tests--marker)
-    (insert "hi\n")
-    (agent-shell-chat-mode-tests--prompt "Claude> ")
-    (let ((runs (agent-shell-chat--prompt-runs)))
-      (should (= 2 (length runs)))
-      (should (< (cdr (nth 0 runs)) (car (nth 1 runs)))))))
 
 (ert-deftest agent-shell-chat-unfaced-prompt-loses-label-test ()
   "A prompt that loses its face (shell-maker reprinted it) loses its label.
@@ -1641,27 +1672,60 @@ failed-command marker above it."
 
 (defmacro agent-shell-chat-mode-tests--with-frame (window &rest body)
   "Show the current buffer alone in a frame of its own and run BODY.
-WINDOW is bound to the window showing it, laid out and ready for
-`posn-at-point'.  The frame is deleted afterwards."
+WINDOW is bound to the selected window showing it, 50 columns wide,
+laid out and ready for `posn-at-point'.  The frame is deleted afterwards."
   (declare (indent 1))
   `(let ((frame (make-frame '((name . "agent-shell-chat-mode-tests")
-                              (width . 60) (height . 20))))
-         (guard 0))
+                              (width . 60) (height . 20)))))
      (unwind-protect
          (let ((,window (frame-root-window frame)))
            (set-window-buffer ,window (current-buffer))
-           (while (and (not (frame-visible-p frame)) (< guard 50))
-             (setq guard (1+ guard))
-             (sit-for 0.1))
-           ;; A tiling compositor may ignore the frame's requested width.
-           ;; Constrain redisplay itself so wrapping tests remain deterministic.
-           (when (> (window-body-width ,window) 50)
-             (set-window-margins ,window nil
-                                 (- (window-body-width ,window) 50)))
-           (should (= 50 (window-body-width ,window)))
-           (redisplay t)
-           ,@body)
+           (with-selected-window ,window
+             (agent-shell-chat-mode-tests--settle-width ,window 50)
+             ,@body))
        (delete-frame frame t))))
+
+(defun agent-shell-chat-mode-tests--settle-width (window width)
+  "Narrow WINDOW's body to WIDTH columns once its frame stops resizing.
+A compositor may resize a new frame after it is first shown, so the
+frame's own width is ignored: the right margin takes up whatever the
+window has beyond WIDTH, measured again after each redisplay until two
+passes agree."
+  (let ((frame (window-frame window))
+        (previous nil)
+        (full nil)
+        (guard 0))
+    (while (and (< guard 50)
+                (not (and (frame-visible-p frame)
+                          (equal previous full)
+                          (= width (window-body-width window)))))
+      (setq guard (1+ guard)
+            previous full)
+      (set-window-margins window nil nil)
+      (sit-for 0.1)
+      (redisplay t)
+      (setq full (window-body-width window))
+      (when (< full width)
+        (error "Test window is %d columns, narrower than %d" full width))
+      (set-window-margins window nil (- full width))
+      (redisplay t))
+    (should (= width (window-body-width window)))))
+
+(defun agent-shell-chat-mode-tests--previous-line (window pos)
+  "Run `previous-line' from POS in WINDOW as a fresh command; return point.
+The goal column is computed afresh rather than carried over from
+whatever motion ran before."
+  (with-selected-window window
+    (goto-char pos)
+    (redisplay t)
+    (let ((line-move-visual t)
+          (this-command 'previous-line)
+          (last-command nil)
+          (goal-column nil)
+          (temporary-goal-column 0))
+      ;; The command itself, not `line-move', is what users run.
+      (with-no-warnings (previous-line 1))
+      (point))))
 
 (ert-deftest agent-shell-chat-leading-prompt-label-at-prompt-test ()
   "A prompt with nothing shown above it carries its label at the prompt.
@@ -1915,20 +1979,19 @@ row."
       (let ((agent-shell-prompt-bar-mode nil))
         (agent-shell-chat--relabel))
       (agent-shell-chat-mode-tests--with-frame window
-        (let* ((input-end (save-excursion (goto-char input) (line-end-position)))
-               (input-row (cdr (posn-col-row (posn-at-point input window))))
-               (end-row (cdr (posn-col-row (posn-at-point (point-max) window))))
-               (landed (with-selected-window window
-                         (goto-char (point-max))
-                         (previous-line 1)
-                         (point)))
-               (landed-row (cdr (posn-col-row (posn-at-point landed window)))))
+        (let ((input-end (save-excursion (goto-char input) (line-end-position)))
+              (input-row (cdr (posn-col-row (posn-at-point input window))))
+              (end-row (cdr (posn-col-row (posn-at-point (point-max) window)))))
           ;; The label and its blank line sit above the input's row.
           (should (= 2 input-row))
           (should (= (1+ input-row) end-row))
-          (should (<= input landed))
-          (should (<= landed input-end))
-          (should (= input-row landed-row)))))))
+          (should (= (+ input (length "first line")) input-end))
+          (let ((landed (agent-shell-chat-mode-tests--previous-line
+                         window (point-max))))
+            (should (<= input landed))
+            (should (<= landed input-end))
+            (should (= input-row
+                       (cdr (posn-col-row (posn-at-point landed window)))))))))))
 
 (ert-deftest agent-shell-chat-leading-prompt-wrapped-first-line-reachable-test ()
   "`previous-line' reaches the first row of a wrapped leading input.
@@ -1949,20 +2012,46 @@ into covered preamble text or the label row."
         (let* ((continuation (+ input 70))
                (input-row (cdr (posn-col-row (posn-at-point input window))))
                (continuation-row
-                (cdr (posn-col-row (posn-at-point continuation window))))
-               (landed (with-selected-window window
-                         (goto-char continuation)
-                         (let ((line-move-visual t)
-                               (last-command nil)
-                               (goal-column nil))
-                           (previous-line 1))
-                         (point)))
-               (landed-row
-                (cdr (posn-col-row (posn-at-point landed window)))))
+                (cdr (posn-col-row (posn-at-point continuation window)))))
           (should (> continuation-row input-row))
-          (should (<= input landed))
-          (should (< landed continuation))
-          (should (= input-row landed-row)))))))
+          (let ((landed (agent-shell-chat-mode-tests--previous-line
+                         window continuation)))
+            (should (<= input landed))
+            (should (< landed continuation))
+            (should (= input-row
+                       (cdr (posn-col-row (posn-at-point landed window)))))))))))
+
+(ert-deftest agent-shell-chat-mode-tests-prompt-field-ends-at-input-test ()
+  "Input typed after the fixture prompt lies outside the prompt's field.
+Field-aware line motion must see the input's first line whole, as it
+does after a real shell-maker prompt."
+  (with-temp-buffer
+    (agent-shell-chat-mode-tests--prompt "Claude> ")
+    (let ((input (point)))
+      (insert "first line\nsecond line")
+      (goto-char input)
+      (should (= (+ input (length "first line")) (line-end-position)))
+      (should (= input (field-beginning (1+ input)))))))
+
+(ert-deftest agent-shell-chat-mode-tests-previous-line-ignores-stale-goal-test ()
+  "The fixture motion helper ignores a goal column left by earlier motion.
+Without a command loop, `this-command' and `last-command' are both nil,
+so `previous-line' would otherwise reuse any `temporary-goal-column'."
+  (skip-unless (display-graphic-p))
+  (with-temp-buffer
+    (insert "first line\nsecond line")
+    (agent-shell-chat-mode-tests--with-frame window
+      (let ((stale '(30.0 . 0))
+            (from (+ (point-min) (length "first line\n") 2)))
+        (dotimes (_ 3)
+          (let ((temporary-goal-column stale)
+                (this-command nil)
+                (last-command nil))
+            (should (= (+ (point-min) 2)
+                       (agent-shell-chat-mode-tests--previous-line window from)))
+            (should (eq stale temporary-goal-column))
+            (should-not this-command)
+            (should-not last-command)))))))
 
 (ert-deftest agent-shell-chat-scroll-advice-guards-test ()
   "Retry only a stalled one-line scroll at a tagged chat header."

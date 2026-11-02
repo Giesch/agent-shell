@@ -19,32 +19,32 @@ Thank you!
 
 =agent-shell= brings your favorite AI agents to [[https://www.gnu.org/software/emacs/][Emacs]], keeping you at home: familiar buffers and bindings, no terminal emulation. All powered by ACP, the [[https://agentclientprotocol.com][Agent Client Protocol]].
 
-Works with 23 agents today, and any other that speaks ACP:
+Works with 24 agents today, and any other that speaks ACP:
 
+- [[https://antigravity.google/docs/ide/extensions][Antigravity]] (Google)
+- [[https://docs.augmentcode.com/cli/overview][Auggie]]
 - [[https://code.claude.com/docs/en/overview][Claude Agent]] (Anthropic)
+- [[https://docs.cline.bot/usage/acp][Cline]]
+- [[https://www.codebuddy.ai][CodeBuddy]]
 - [[https://github.com/agentclientprotocol/codex-acp][Codex]] (OpenAI)
+- [[https://cursor.com/docs/cli][Cursor]]
+- [[https://github.com/deepseek-ai/deepseek-harness][DeepSeek Harness]]
+- [[https://factory.ai][Factory Droid]]
 - [[https://github.com/google-gemini/gemini-cli][Gemini CLI]] (Google)
+- [[https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server][GitHub Copilot]]
 - [[https://goose-docs.ai/docs/getting-started/installation][Goose]]
 - [[https://docs.x.ai/docs/overview][Grok Build]] (xAI)
-- [[https://cursor.com/docs/cli][Cursor]]
-- [[https://docs.cline.bot/usage/acp][Cline]]
-- [[https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server][GitHub Copilot]]
+- [[https://github.com/NousResearch/hermes-agent][Hermes]]
+- [[https://junie.jetbrains.com/docs/junie-cli-acp.html][Junie]] (JetBrains)
 - [[https://www.kimi.com/code][Kimi Code CLI]]
-- [[https://www.codebuddy.ai][CodeBuddy]]
-- [[https://github.com/deepseek-ai/deepseek-harness][DeepSeek Harness]]
 - [[https://kiro.dev][Kiro CLI]]
+- [[https://github.com/mistralai/mistral-vibe][Mistral Vibe]]
+- [[https://github.com/can1357/oh-my-pi][Oh My Pi]]
+- [[https://openclaw.ai][OpenClaw]]
+- [[https://opencode.ai][OpenCode]]
+- [[https://github.com/svkozak/pi-acp][Pi]]
 - [[https://qoder.com][Qoder CLI]]
 - [[https://github.com/QwenLM/qwen-code][Qwen Code]]
-- [[https://docs.augmentcode.com/cli/overview][Auggie]]
-- [[https://github.com/mistralai/mistral-vibe][Mistral Vibe]]
-- [[https://factory.ai][Factory Droid]]
-- [[https://github.com/svkozak/pi-acp][Pi]]
-- [[https://github.com/can1357/oh-my-pi][Oh My Pi]]
-- [[https://github.com/NousResearch/hermes-agent][Hermes]]
-- [[https://opencode.ai][OpenCode]]
-- [[https://openclaw.ai][OpenClaw]]
-- [[https://antigravity.google/docs/ide/extensions][Antigravity]] (Google)
-- [[https://junie.jetbrains.com/docs/junie-cli-acp.html][Junie]] (JetBrains)
 
 [[https://www.youtube.com/watch?v=R2Ucr3amgGg][agent-shell - YouTube]]
 
@@ -213,6 +213,14 @@ does not inherit it from your shell, set it via
 #+begin_src emacs-lisp
 (setq agent-shell-deepseek-authentication
       (agent-shell-deepseek-make-authentication :api-key "your-key"))
+#+end_src
+
+agent-shell launches =dsh --profile acp=, which keeps its own settings
+separate from other dsh profiles.  If models configured elsewhere (for
+example, via the dsh web UI) are missing, copy them over:
+
+#+begin_src bash
+cp -i ~/.dsh/profiles/web/cordis.patch.yml ~/.dsh/profiles/acp/cordis.patch.yml
 #+end_src
 
 See https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/acp/acp/README.md for details.
@@ -799,6 +807,23 @@ Huge thanks for /gdindi/ for finding and and describing this in https://github.c
 
 By default, =agent-shell= includes configurations for all supported agents (Claude Agent, Gemini CLI, Codex, Goose, Grok Build, Cursor, CodeBuddy, Qwen Code, and Auggie). You can customize which agents are available through the =agent-shell-agent-configs= variable.
 
+*** Handling provider notifications
+
+Provider implementations can set =:notification-handler= in =agent-shell-make-agent-config= to handle custom ACP notifications. The callback runs after =:notification-adapter= and receives an event alist containing =:state= and the adapted =:acp-notification=. Return non-nil when handled, or nil to continue with core notification handling.
+
+#+begin_src emacs-lisp
+  (agent-shell-make-agent-config
+   :identifier 'example
+   :notification-handler
+   (lambda (event)
+     (when (equal (map-nested-elt event '(:acp-notification method))
+                  "_example/status")
+       (message "%s" (map-nested-elt event '(:acp-notification params text)))
+       t)))
+#+end_src
+
+Return nil for standard notifications such as =session/update= so core keeps rendering them. See =C-h f agent-shell-make-agent-config= for the configuration options.
+
 ** Usage
 
 *** Quick Start
@@ -1061,6 +1086,17 @@ All of the above settings can be applied on a per-project basis using [[https://
                   ("C-c C-c" . shell-maker-submit)
                   ("C-c C-k" . agent-shell-interrupt)))
   #+end_src
+
+*** Folding sections
+
+Thoughts, tool calls, user messages and activity groups fold under their header line. With point on a header:
+
+- =RET= (or click) - Expand or collapse the section.
+- =C-u RET= - Expand or collapse the section's activity group, along with every section inside it.
+
+These keys only apply on headers, so =RET= still submits the prompt everywhere else. To fold with other keys, add them to =agent-shell-ui-fragment-map=.
+
+Use =M-x agent-shell-ui-toggle-all-fragments= to expand or collapse every section in the buffer.
 
 *** Session controls
 
