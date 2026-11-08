@@ -159,7 +159,7 @@ Returns an agent configuration alist using `agent-shell-make-agent-config'."
                         . ((thinking
                             . ((type . "adaptive")
                                (display . "summarized"))))))))
-   :install-instructions "See https://github.com/agentclientprotocol/claude-agent-acp for installation."))
+   :install-instructions "See https://github.com/Giesch/agent-shell#claude-agent-sdk for the pinned Giesch/claude-agent-acp installation instructions."))
 
 (defun agent-shell-anthropic-start-claude-code ()
   "Start an interactive Claude Agent shell."

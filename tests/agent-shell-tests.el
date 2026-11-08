@@ -5793,6 +5793,7 @@ so the form still carries one field."
     (should (equal 'question_0 (map-elt (car fields) :name)))
     (should (equal '((:name . question_0_custom)
                      (:join-multi . t)
+                     (:with-selection)
                      (:question . question_0)
                      (:title . "Other")
                      (:description . "Type your own answer"))

@@ -130,10 +130,17 @@ Thanks to [[https://github.com/lobehub/lobe-icons][Lobe Icons]] for the lovely i
 
 *** Claude Agent SDK
 
-For Anthropic's [[https://code.claude.com/docs/en/overview][Claude Agent]] (formerly known as the Claude Code), follow [[https://github.com/agentclientprotocol/claude-agent-acp][claude-agent-acp instructions]], typically something like:
+This fork uses [[https://github.com/Giesch/claude-agent-acp][Giesch/claude-agent-acp]] for Anthropic's [[https://code.claude.com/docs/en/overview][Claude Agent]] (formerly known as Claude Code). The adapter fork supplies the custom-answer companion metadata used by the question forms, so selections and optional notes can be submitted together.
+
+Install the pinned adapter revision from source with Node.js >= 22:
 
 #+begin_src bash
-npm install -g @agentclientprotocol/claude-agent-acp
+git clone https://github.com/Giesch/claude-agent-acp.git
+cd claude-agent-acp
+git checkout c7cf7cdd7c8db530cc90fe411b9273b90f371f90
+npm ci
+npm run build
+npm install -g .
 #+end_src
 
 *Note:* The =-g= flag is required to install the binary globally so it's available in your PATH. After installation, verify it's available by running =which claude-agent-acp= in your terminal.
@@ -411,9 +418,10 @@ You can install via:
       :ensure t
       :ensure-system-package
       ;; Add agent installation configs here
-      ((claude . "brew install claude-code")
-       (claude-agent-acp . "npm install -g @agentclientprotocol/claude-agent-acp")))
+      (claude . "brew install claude-code"))
 #+end_src
+
+Install =claude-agent-acp= from the pinned fork revision in [[*Claude Agent SDK][Claude Agent SDK]] above.
 
 This will automatically install the required dependencies ([[https://melpa.org/#/acp][acp.el]] and [[https://melpa.org/#/shell-maker][shell-maker]]).
 
@@ -1609,7 +1617,7 @@ Sometimes including a traffic screenshot in an issue is enough. Other times incl
 
 If you're able to determine the agent is missing a feature (or a bug is present) in their [[https://agentclientprotocol.com][Agent Client Protocol]] implementation, please file an issue directly with the agent folks. For example:
 
-- [[https://github.com/agentclientprotocol/claude-agent-acp][claude-agent-acp]]: For Claude Agent.
+- [[https://github.com/Giesch/claude-agent-acp][claude-agent-acp]]: For Claude Agent in this fork.
 - [[https://github.com/zed-industries/codex-acp][codex-acp]]: For Codex.
 - [[https://github.com/google-gemini/gemini-cli][Gemini CLI]].
 - [[https://block.github.io/goose/docs/getting-started/installation][Goose]].

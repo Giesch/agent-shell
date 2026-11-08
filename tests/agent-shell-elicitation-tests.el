@@ -702,5 +702,183 @@ MODE selects option, other, or text entry.  Values are synthetic."
      (funcall (agent-shell-elicitation-tests--button "Approach A" "p"))
      (should-not (string-search "Long preview body" (buffer-string))))))
 
+;;; Claude companion marker: `_claude/askUserQuestionCustomAnswer'.
+
+(defun agent-shell-elicitation-tests--marker (question with-selection)
+  "Return companion metadata for QUESTION with WITH-SELECTION."
+  `((_claude/askUserQuestionCustomAnswer . ((questionId . ,question)
+                                            (withSelection . ,with-selection)))))
+
+(defun agent-shell-elicitation-tests--note-schema (&optional multi)
+  "Return the requested schema that claude-agent-acp sends for two questions.
+
+With MULTI, the second question is a multi-select question."
+  (let ((note "Type your own answer, or add a note to the option you chose above (optional).")
+        (append "Type your own answer to add to your selection above (optional)."))
+    `((type . "object")
+      (properties
+       . ((question_0 . ((type . "string") (title . "Auth") (description . "Which auth approach?")
+                         (oneOf . [((const . "JWT") (title . "JWT"))
+                                   ((const . "Session") (title . "Session"))])))
+          (question_0_custom . ((type . "string") (title . "Other") (description . ,note)
+                                (_meta . ,(agent-shell-elicitation-tests--marker "question_0" "note"))))
+          (question_1 . ,(if multi
+                             '((type . "array") (title . "Database") (description . "Which databases?")
+                               (items . ((anyOf . [((const . "Postgres") (title . "Postgres"))
+                                                   ((const . "SQLite") (title . "SQLite"))]))))
+                           '((type . "string") (title . "Database") (description . "Which database?")
+                             (oneOf . [((const . "Postgres") (title . "Postgres"))
+                                       ((const . "SQLite") (title . "SQLite"))]))))
+          (question_1_custom . ((type . "string") (title . "Other")
+                                (description . ,(if multi append note))
+                                (_meta . ,(agent-shell-elicitation-tests--marker
+                                           "question_1" (if multi "append" "note"))))))))))
+
+(defun agent-shell-elicitation-tests--point-at (label)
+  "Check that point is on the focused button row with LABEL."
+  (should (get-text-property (point) 'agent-shell-button-focus))
+  (should (string-search label (buffer-substring-no-properties
+                                (line-beginning-position) (line-end-position)))))
+
+(defun agent-shell-elicitation-tests--sent-content (state)
+  "Return the one accepted response content of STATE, sorted by key."
+  (agent-shell-fakes--settle)
+  (let ((responses (acp-fakes-sent-responses (map-elt state :client))))
+    (should (= 1 (length responses)))
+    (should (equal "accept" (map-nested-elt (car responses) '(:result action))))
+    (sort (copy-sequence (map-nested-elt (car responses) '(:result content)))
+          (lambda (a b) (string< (car a) (car b))))))
+
+(ert-deftest agent-shell-elicitation-custom-answer-marker-normalizes-test ()
+  "Pair a marked companion with its question and keep the choice with the text."
+  (let* ((model (agent-shell--normalize-elicitation (agent-shell-elicitation-tests--note-schema)))
+         (fields (map-elt model :fields)))
+    (should-not (map-elt model :reason))
+    (should (equal '(question_0 question_1) (mapcar (lambda (field) (map-elt field :name)) fields)))
+    (should (eq 'note (map-nested-elt (car fields) '(:custom :with-selection))))
+    (should-not (map-nested-elt (car fields) '(:custom :join-multi)))
+    (should-not (agent-shell--elicitation-invalid-field
+                 model '((question_0 . "JWT") (question_0_custom . "note"))))
+    (should-not (agent-shell--elicitation-invalid-field model '((question_0_custom . "Mine")))))
+  (let ((fields (map-elt (agent-shell--normalize-elicitation
+                          (agent-shell-elicitation-tests--note-schema t))
+                         :fields)))
+    (should (eq 'append (map-nested-elt (cadr fields) '(:custom :with-selection))))
+    (should-not (map-nested-elt (cadr fields) '(:custom :join-multi))))
+  (let ((legacy (agent-shell--normalize-elicitation
+                 '((type . "object")
+                   (properties . ((q . ((type . "string") (oneOf . [((const . "Exact"))])))
+                                  (other . ((type . "string")
+                                            (_meta . ((_askUserQuestionCustomAnswer
+                                                       . ((questionId . "q")))))))))))))
+    (should (agent-shell--elicitation-invalid-field legacy '((q . "Exact") (other . "note"))))))
+
+(ert-deftest agent-shell-elicitation-custom-answer-marker-rejects-malformed-test ()
+  "Reject a malformed or contradictory companion marker."
+  (dolist (meta '(((_claude/askUserQuestionCustomAnswer . ((withSelection . "note"))))
+                  ((_claude/askUserQuestionCustomAnswer . ((questionId . "q"))))
+                  ((_claude/askUserQuestionCustomAnswer . ((questionId . "q") (withSelection . "replace"))))
+                  ((_claude/askUserQuestionCustomAnswer . ((questionId . 7) (withSelection . "note"))))
+                  ((_claude/askUserQuestionCustomAnswer
+                    . ((questionId . "q") (withSelection . "note") (extra . t))))
+                  ((_claude/askUserQuestionCustomAnswer . ((questionId . "q") (withSelection . "note")))
+                   (_askUserQuestionCustomAnswer . ((questionId . "different"))))))
+    (should (map-elt (agent-shell--normalize-elicitation
+                      `((type . "object")
+                        (properties . ((q . ((type . "string") (oneOf . [((const . "a"))])))
+                                       (other . ((type . "string") (_meta . ,meta)))))))
+                     :reason))))
+
+(ert-deftest agent-shell-elicitation-custom-answer-marker-focus-test ()
+  "Advance focus past blank notes to the next question and then to Submit."
+  (agent-shell-elicitation-tests--call
+   (agent-shell-elicitation-tests--note-schema)
+   (lambda (state)
+     (agent-shell-elicitation-tests--point-at "JWT")
+     (funcall (agent-shell-elicitation-tests--button "JWT"))
+     (agent-shell-elicitation-tests--point-at "Postgres")
+     (funcall (agent-shell-elicitation-tests--button "SQLite"))
+     (agent-shell-elicitation-tests--point-at "Submit")
+     (funcall (agent-shell-elicitation-tests--button "Postgres"))
+     (agent-shell-elicitation-tests--point-at "Submit")
+     (funcall (agent-shell-elicitation-tests--button "Session"))
+     (agent-shell-elicitation-tests--point-at "Submit")
+     (should-not (acp-fakes-sent-responses (map-elt state :client))))
+   nil "elicitation-two-questions.traffic"))
+
+(ert-deftest agent-shell-elicitation-custom-answer-marker-note-test ()
+  "Keep a note when the choice changes and the choice when the note changes."
+  (agent-shell-elicitation-tests--call
+   (agent-shell-elicitation-tests--note-schema)
+   (lambda (state)
+     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "first note")))
+       (funcall (agent-shell-elicitation-tests--button "Other" "o")))
+     (funcall (agent-shell-elicitation-tests--button "JWT"))
+     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "rotate keys")))
+       (funcall (agent-shell-elicitation-tests--button "Other" "o")))
+     (funcall (agent-shell-elicitation-tests--button "Session"))
+     (funcall (agent-shell-elicitation-tests--button "Postgres"))
+     (should-not (acp-fakes-sent-responses (map-elt state :client)))
+     (funcall (agent-shell-elicitation-tests--button "Submit"))
+     (should (equal '((question_0 . "Session") (question_0_custom . "rotate keys")
+                      (question_1 . "Postgres"))
+                    (agent-shell-elicitation-tests--sent-content state))))
+   nil "elicitation-two-questions.traffic"))
+
+(ert-deftest agent-shell-elicitation-custom-answer-marker-wire-test ()
+  "Send a choice with its note, a note cleared to blank, and text alone."
+  (agent-shell-elicitation-tests--call
+   (agent-shell-elicitation-tests--note-schema)
+   (lambda (state)
+     (funcall (agent-shell-elicitation-tests--button "JWT"))
+     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "rotate keys")))
+       (funcall (agent-shell-elicitation-tests--button "Other" "o")))
+     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "Mine")))
+       (funcall (agent-shell-elicitation-tests--button "SQLite" "o")))
+     (funcall (agent-shell-elicitation-tests--button "Submit"))
+     (should (equal '((question_0 . "JWT") (question_0_custom . "rotate keys")
+                      (question_1_custom . "Mine"))
+                    (agent-shell-elicitation-tests--sent-content state))))
+   nil "elicitation-two-questions.traffic")
+  (agent-shell-elicitation-tests--call
+   (agent-shell-elicitation-tests--note-schema)
+   (lambda (state)
+     (funcall (agent-shell-elicitation-tests--button "JWT"))
+     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "rotate keys")))
+       (funcall (agent-shell-elicitation-tests--button "Other" "o")))
+     (funcall (agent-shell-elicitation-tests--button "Clear"))
+     (funcall (agent-shell-elicitation-tests--button "Postgres"))
+     (funcall (agent-shell-elicitation-tests--button "Submit"))
+     (should (equal '((question_0 . "JWT") (question_1 . "Postgres"))
+                    (agent-shell-elicitation-tests--sent-content state))))
+   nil "elicitation-two-questions.traffic"))
+
+(ert-deftest agent-shell-elicitation-custom-answer-marker-append-test ()
+  "Send a multi-select selection and its appended text as separate keys."
+  (agent-shell-elicitation-tests--call
+   (agent-shell-elicitation-tests--note-schema t)
+   (lambda (state)
+     (funcall (agent-shell-elicitation-tests--button "JWT"))
+     (funcall (agent-shell-elicitation-tests--button "SQLite"))
+     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "DuckDB")))
+       (funcall (agent-shell-elicitation-tests--button "SQLite" "o")))
+     (funcall (agent-shell-elicitation-tests--button "Submit"))
+     (should (equal '((question_0 . "JWT") (question_1 . ["SQLite"]) (question_1_custom . "DuckDB"))
+                    (agent-shell-elicitation-tests--sent-content state))))
+   nil "elicitation-two-questions.traffic"))
+
+(ert-deftest agent-shell-elicitation-custom-answer-marker-control-return-test ()
+  "Complete with blank notes through C-RET, and never with a question open."
+  (agent-shell-elicitation-tests--call
+   (agent-shell-elicitation-tests--note-schema)
+   (lambda (state)
+     (call-interactively (agent-shell-elicitation-tests--button "JWT" "C-<return>"))
+     (agent-shell-fakes--settle)
+     (should-not (acp-fakes-sent-responses (map-elt state :client)))
+     (call-interactively (agent-shell-elicitation-tests--button "SQLite" "C-<return>"))
+     (should (equal '((question_0 . "JWT") (question_1 . "SQLite"))
+                    (agent-shell-elicitation-tests--sent-content state))))
+   nil "elicitation-two-questions.traffic"))
+
 (provide 'agent-shell-elicitation-tests)
 ;;; agent-shell-elicitation-tests.el ends here

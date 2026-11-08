@@ -50,15 +50,30 @@
               (agent-shell--elicitation-reject 'malformed-presentation)))
           object))
 
+(defconst agent-shell-elicitation--custom-answer-meta-key
+  '_claude/askUserQuestionCustomAnswer
+  "ACP property metadata key that marks a Claude companion field.
+
+The value is an object such as
+  ((questionId . \"question_0\") (withSelection . \"note\"))
+where withSelection is \"note\" or \"append\".")
+
 (defun agent-shell--elicitation-metadata (spec)
   "Validate SPEC metadata and return companion identity and sensitivity.
+
+The result carries :with-selection, which is `note' or `append' for a
+companion marked with `agent-shell-elicitation--custom-answer-meta-key'
+and nil otherwise.
 
 Only `_meta.codex.isSecret' marks a supported sensitive property."
   (let* ((meta (map-elt spec '_meta))
          (claude (map-elt meta '_askUserQuestionCustomAnswer))
+         (marker (map-elt meta agent-shell-elicitation--custom-answer-meta-key))
          (codex (map-elt meta 'codex))
          (claude-id (map-elt claude 'questionId))
-         (codex-id (map-elt codex 'questionId)))
+         (marker-id (map-elt marker 'questionId))
+         (codex-id (map-elt codex 'questionId))
+         (ids (delete-dups (delq nil (list claude-id marker-id codex-id)))))
     (when (map-contains-key spec '_meta)
       (unless (and (listp meta) (seq-every-p #'consp meta))
         (agent-shell--elicitation-reject 'malformed-metadata)))
@@ -67,6 +82,11 @@ Only `_meta.codex.isSecret' marks a supported sensitive property."
       (unless (and (stringp claude-id)
                    (or (not (map-contains-key claude 'isCustomAnswer))
                        (eq (map-elt claude 'isCustomAnswer) t)))
+        (agent-shell--elicitation-reject 'malformed-companion)))
+    (when (map-contains-key meta agent-shell-elicitation--custom-answer-meta-key)
+      (agent-shell--elicitation-object marker '(questionId withSelection))
+      (unless (and (stringp marker-id)
+                   (member (map-elt marker 'withSelection) '("note" "append")))
         (agent-shell--elicitation-reject 'malformed-companion)))
     (when (map-contains-key meta 'codex)
       (agent-shell--elicitation-object codex '(questionId isOtherAnswer isOther isSecret))
@@ -78,18 +98,21 @@ Only `_meta.codex.isSecret' marks a supported sensitive property."
                 (map-contains-key codex 'isOtherAnswer))
         (unless (and (stringp codex-id) (eq (map-elt codex 'isOtherAnswer) t))
           (agent-shell--elicitation-reject 'malformed-companion))))
-    (when (and claude-id codex-id (not (equal claude-id codex-id)))
+    (when (cdr ids)
       (agent-shell--elicitation-reject 'contradictory-companion))
     (map-do
      (lambda (key value)
-       (unless (memq key '(codex _askUserQuestionCustomAnswer))
+       (unless (memq key (list 'codex '_askUserQuestionCustomAnswer
+                               agent-shell-elicitation--custom-answer-meta-key))
          (when (agent-shell--elicitation-sensitive-metadata-p value)
            (agent-shell--elicitation-reject 'unknown-sensitive-metadata))))
      meta)
     (when (map-contains-key meta 'isSecret)
       (agent-shell--elicitation-reject 'unknown-sensitive-metadata))
-    (list (cons :companion (and (or claude-id codex-id) t))
-          (cons :question (when-let* ((id (or claude-id codex-id))) (intern id)))
+    (list (cons :companion (and ids t))
+          (cons :question (when ids (intern (car ids))))
+          (cons :with-selection (when marker-id
+                                  (intern (map-elt marker 'withSelection))))
           (cons :secret (eq (map-elt codex 'isSecret) t)))))
 
 (defun agent-shell--elicitation-sensitive-metadata-p (value)
@@ -135,7 +158,9 @@ Only `_meta.codex.isSecret' marks a supported sensitive property."
                  (not (stringp (map-elt spec 'default))))
         (agent-shell--elicitation-reject 'invalid-default))
       (list (cons :name name)
-            (cons :join-multi (map-contains-key (map-elt spec '_meta) '_askUserQuestionCustomAnswer))
+            (cons :join-multi (and (not (map-elt metadata :with-selection))
+                                   (map-contains-key (map-elt spec '_meta) '_askUserQuestionCustomAnswer)))
+            (cons :with-selection (map-elt metadata :with-selection))
             (cons :question (map-elt metadata :question))
             (cons :title (or (map-elt spec 'title) "Other"))
             (cons :description (map-elt spec 'description))))))
@@ -316,6 +341,15 @@ Invalid numeric input stays in the editor loop and is never coerced."
   (let ((model (agent-shell--normalize-elicitation requested-schema)))
     (if (map-elt model :reason) 'unsupported (map-elt model :fields))))
 
+(defun agent-shell--elicitation-companion-coexists-p (field)
+  "Return non-nil when FIELD's choice and its Other text can both be set.
+
+A companion marked with `agent-shell-elicitation--custom-answer-meta-key'
+coexists with the choice: the agent reads the text as a note on a
+single-select choice, or as one more item of a multi-select answer.
+Other companions of a single-select field replace the choice."
+  (and (map-nested-elt field '(:custom :with-selection)) t))
+
 (defun agent-shell--elicitation-invalid-field (elicitation content)
   "Return a safe validation failure for ELICITATION and CONTENT, or nil.
 
@@ -330,6 +364,7 @@ The result contains :reason and :field; it never contains answer values."
           (push name allowed)
           (when companion (push custom allowed))
           (when (or (and (not (map-elt field :multi))
+                          (not (agent-shell--elicitation-companion-coexists-p field))
                           (map-contains-key content name) companion (map-contains-key content custom))
                     (and companion (map-contains-key content custom) (not (stringp (map-elt content custom))))
                     (and (map-contains-key content name)
@@ -346,9 +381,8 @@ The result contains :reason and :field; it never contains answer values."
 (defun agent-shell--elicitation-field-answered-p (answers field)
   "Return non-nil when ANSWERS carries an answer to FIELD.
 
-A question is answered through its options or through its Other box.  The
-agent prefers a non-empty Other box over the options, so either one
-answers the question."
+A question counts as answered when its options or its Other box carry
+a value."
   (or (map-contains-key answers (map-elt field :name))
       (when (map-elt field :custom)
         (map-contains-key answers (map-nested-elt field '(:custom :name))))))
@@ -450,7 +484,8 @@ FIELD, VALUE, SUBMIT and OPERATION select the edit or terminal action."
                      (agent-shell--answer-elicitation
                       :state state :request-id request-id :client client :field-name name
                       :value (unless (equal text "") text)
-                      :clear (when (and (eq operation 'other) (not (map-elt field :multi)))
+                      :clear (when (and (eq operation 'other) (not (map-elt field :multi))
+                                        (not (agent-shell--elicitation-companion-coexists-p field)))
                                 (list (map-elt field :name)))
                       :submit (and submit (not (equal text "")))))))
                 (_
@@ -458,7 +493,8 @@ FIELD, VALUE, SUBMIT and OPERATION select the edit or terminal action."
                   :state state :request-id request-id :client client
                   :field-name (if (eq operation 'clear-other) (map-nested-elt field '(:custom :name)) (map-elt field :name))
                   :clear (when (and (not (map-elt field :multi))
-                                    (not (memq operation '(clear clear-other))) (map-elt field :custom))
+                                    (not (memq operation '(clear clear-other))) (map-elt field :custom)
+                                    (not (agent-shell--elicitation-companion-coexists-p field)))
                            (list (map-nested-elt field '(:custom :name))))
                   :value (pcase operation
                            ((or 'clear 'clear-other) nil)
@@ -547,9 +583,10 @@ which the button's own keymap extends.  STATE, REQUEST-ID, and CLIENT
 identify the elicitation to update.
 
 The button carries the glyph of its question rather than a radio in every
-form, so one row reads as one kind of question.  Recording free text
-drops the question's selection, so the cleared options already show that
-the box replaces them.
+form, so one row reads as one kind of question.  For a single-select
+question, recording free text drops the selection unless
+`agent-shell--elicitation-companion-coexists-p' holds, in which case the
+text is a note on the selection.
 
 For example:
 
@@ -1188,7 +1225,9 @@ DISCONNECTED retires an old connection without sending a response."
                              ((and (eq (map-elt field :kind) 'boolean)
                                    (memq name (map-elt record :required)))
                               (cons name :false)))))
-                      (delq nil (list (unless (and custom-answer (not (map-elt field :multi))) answer)
+                      (delq nil (list (unless (and custom-answer (not (map-elt field :multi))
+                                                   (not (agent-shell--elicitation-companion-coexists-p field)))
+                                        answer)
                                       custom-answer))))
                   (map-elt record :fields)))
                 (agent-shell--elicitation-put! record :properties nil)
@@ -1314,8 +1353,12 @@ DISCONNECTED retires an old connection without sending a response."
                                          (or (eq (car entry) (map-elt field :name))
                                              (eq (car entry) (map-nested-elt field '(:custom :name)))))
                                        (map-elt record :fields))))
-                           (format "%s: %s"
+                           (format "%s%s: %s"
                                    (or (map-elt field :title) (map-elt field :name) (car entry))
+                                   (if (and (agent-shell--elicitation-companion-coexists-p field)
+                                            (eq (car entry) (map-nested-elt field '(:custom :name))))
+                                       (format " (%s)" (map-nested-elt field '(:custom :title)))
+                                     "")
                                    (cdr entry))))
                        redacted))
               "\n")
